@@ -10,7 +10,7 @@
 
 ## 本地启动
 
-使用 Node.js 22.12+ 或支持的更新版本：
+使用 Node.js 20.19+（20.x）或 22.12+。本机 Node.js 20.20.2 已验证构建通过：
 
 ```powershell
 npm install
