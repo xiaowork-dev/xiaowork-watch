@@ -942,11 +942,11 @@ def uninstall(manager, confirm=False, paths=DEFAULT_PATHS, locked=None, purge=Fa
 
 def _open_terminal():
     try:
-        return open("/dev/tty", "r+", encoding="utf-8", buffering=1)
+        return open("/dev/tty", "r+", encoding="utf-8", errors="replace", buffering=1)
     except io.UnsupportedOperation:
         # Some Python builds reject BufferedRandom on a non-seekable tty.
         raw = open("/dev/tty", "r+b", buffering=0)
-        return io.TextIOWrapper(raw, encoding="utf-8", write_through=True)
+        return io.TextIOWrapper(raw, encoding="utf-8", errors="replace", write_through=True)
 
 
 def _say(terminal, text):
@@ -955,10 +955,18 @@ def _say(terminal, text):
 
 
 def _ask(terminal, text):
-    terminal.write(text)
-    terminal.flush()
-    line = terminal.readline()
-    return line.strip() if line else None
+    while True:
+        terminal.write(text)
+        terminal.flush()
+        line = terminal.readline()
+        if not line:
+            return None
+        # Reject the entire damaged line; dropping undecodable bytes could
+        # turn malformed input into a valid YES or UNINSTALL confirmation.
+        if "\ufffd" in line:
+            _say(terminal, "输入含有无效的 UTF-8 字符，本行未采用。请将 SSH 客户端编码设为 UTF-8 后重新输入。")
+            continue
+        return line.strip()
 
 
 def _status_text(manager):
