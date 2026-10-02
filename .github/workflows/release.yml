@@ -63,6 +63,7 @@ jobs:
       - name: Build monitoring frontend
         run: |
           node tests/test_frontend.mjs
+          npm run test:theme
           npm run build
       - name: Package verified build
         env:

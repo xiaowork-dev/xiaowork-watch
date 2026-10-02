@@ -1,12 +1,13 @@
 {
   "name": "xiaowork-watch",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 5173 --strictPort",
     "build": "vite build",
-    "preview": "vite preview --host 127.0.0.1"
+    "preview": "vite preview --host 127.0.0.1",
+    "test:theme": "node scripts/check-theme.mjs"
   },
   "dependencies": {
     "vue": "^3.5.22",

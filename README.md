@@ -1,6 +1,6 @@
 # xiaowork Watch
 
-个人网站与 VPS 监控平台，v0.4.0 支持每台 VPS 到外部测速目标的 ICMP / TCP 检测。Vue 3 前端、Python 3 主控、SQLite 数据库；Ubuntu/Debian 一键部署无需 Node.js、Java 或独立数据库。
+个人网站与 VPS 监控平台，支持每台 VPS 到外部测速目标的 ICMP / TCP 检测。Vue 3 前端、Python 3 主控、SQLite 数据库；Ubuntu/Debian 一键部署无需 Node.js、Java 或独立数据库。
 
 ## 使用方式
 
@@ -10,6 +10,12 @@
 - VPS：安装探针后每 30 秒上报心跳，并从该 VPS 向关联的域名/IP 测速目标发起真实 ICMP Ping 或 TCP 连接；每轮 5 次，记录平均延迟、ICMP 丢包或 TCP 连接失败率。测速目标不需要服务器权限或安装探针。
 
 监控、账号、历史保存在服务器数据库中，更新与 HTTP/HTTPS 切换不会重置。初始列表为空。旧原型 localStorage 数据不自动导入真实数据库，不再生成演示结果。
+
+## 页面外观
+
+v0.5.0 采用顶部导航与暖白状态页设计。所有页面右上方提供 **日间 / 夜间 / 跟随系统**；手机上同样可切换。默认跟随系统，并在系统主题变化时自动更新。手动选择会保存在当前浏览器、当前站点，刷新后保留，同源标签页同步；不会更改监控配置或登录权限。
+
+夜间主题覆盖公开页、管理员登录、编辑表单、删除确认、VPS 安装命令和检测历史。网站列表先显示启用中的失败监控，未检测与停用分开计数。初始监控列表继续为空，界面只展示服务器返回的真实数据。
 
 ## 一键部署 / 从旧版升级
 
@@ -60,6 +66,7 @@ python backend/server.py --data-dir .local-data --host 127.0.0.1 --port 8091 --a
 ```powershell
 python -m unittest discover -s tests -p 'test_*.py'
 node tests/test_frontend.mjs
+npm run test:theme
 npm run build
 ```
 

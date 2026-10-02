@@ -2,6 +2,28 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
+    <script data-theme-bootstrap>
+    (function bootstrapTheme(browser, document) {
+      let preference = 'system'
+      let systemDark = false
+      try {
+        const saved = browser.localStorage.getItem('xiaowork-watch-theme')
+        if (saved === 'light' || saved === 'dark') preference = saved
+      } catch {}
+      try {
+        systemDark = browser.matchMedia('(prefers-color-scheme: dark)').matches
+      } catch {}
+      const theme = preference === 'system' ? (systemDark ? 'dark' : 'light') : preference
+      document.documentElement.dataset.theme = theme
+      document.documentElement.dataset.themePreference = preference
+      document.documentElement.style.colorScheme = theme
+    })(window, document);
+    </script>
+    <style>
+      html { background: #F7F5F0; }
+      html[data-theme=dark] { background: #1D211C; }
+    </style>
+
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="description" content="xiaowork Watch 网站与 VPS 监控平台，管理服务、探针和自定义测试节点，查看延迟与丢包。公开查看真实检测状态，管理员登录管理。" />
