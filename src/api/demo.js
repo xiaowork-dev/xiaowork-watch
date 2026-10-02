@@ -2,25 +2,9 @@ import { requireMonitor } from './model.js'
 const STORAGE_KEY = 'xiaowork-watch-prototype-v1'
 const delay = (ms = 140) => new Promise(resolve => setTimeout(resolve, ms))
 const clone = value => JSON.parse(JSON.stringify(value))
-export function createSeed(now = Date.now()) {
- const definitions = [
-  ['个人博客', 'https://blog.xiaowork.example', 'B', 'purple', 128, true, 'UP'],
-  ['公共 API', 'https://api.xiaowork.example/health', 'A', 'blue', 86, true, 'UP'],
-  ['导航站', 'https://links.xiaowork.example', 'N', 'orange', 213, true, 'UP'],
-  ['文件服务', 'https://files.xiaowork.example', 'F', 'pink', 502, true, 'DOWN'],
-  ['开发环境', 'https://dev.xiaowork.example', 'D', 'teal', null, true, 'UNKNOWN'],
-  ['备用接口', 'https://backup.xiaowork.example/health', 'R', 'gray', 156, false, 'UP'],
- ]
- const checks = []
- const monitors = definitions.map(([name, url, initial, color, ms, enabled, status], index) => {
-  const id = index + 1, lastTime = now - (enabled ? 20000 + index * 6000 : 900000)
-  if (status !== 'UNKNOWN') for (let i = 0; i < 24; i++) {
-   const failure = id === 4 && i < 5
-   checks.push({ id: `${id}-${i}`, monitorId: id, success: !failure, httpCode: failure ? 503 : 200, responseTimeMs: ms + (i === 0 ? 0 : (i % 5 - 2) * 9), errorType: failure ? 'HTTP_STATUS' : null, errorMessage: failure ? '返回 HTTP 503，目标服务暂时不可用。' : null, checkedAt: new Date(lastTime - i * 60000).toISOString() })
-  }
-  return { id, name, url, initial, color, method: 'GET', intervalSeconds: 60, timeoutMs: 5000, enabled, lastStatus: status, lastHttpCode: status === 'UNKNOWN' ? null : id === 4 ? 503 : 200, lastResponseTimeMs: ms, lastCheckedAt: status === 'UNKNOWN' ? null : new Date(lastTime).toISOString(), createdAt: new Date(now - 86400000).toISOString(), updatedAt: new Date(now - 86400000).toISOString(), demoFailure: id === 4 }
- })
- return { version: 1, nextId: 7, monitors, checks }
+export function createSeed() {
+ // Only used when this browser has no saved data; existing configurations stay intact.
+ return { version: 1, nextId: 1, monitors: [], checks: [] }
 }
 function load() {
  let stored

@@ -2,6 +2,7 @@
 """Chinese terminal operations for the managed static frontend (Python 3.8+)."""
 import contextlib
 from dataclasses import dataclass
+import glob
 import io
 import json
 import os
@@ -12,11 +13,22 @@ import subprocess
 import sys
 import tempfile
 import secrets
+import shutil
+import http.client
+import socket
+import ssl
+import time
 from urllib.parse import urlsplit
 
 OWNER = "# Managed by xiaowork Watch's frontend installer."
 ROOT_PREFIX = "# xiaowork-watch-root: "
 MARKER_VALUE = "xiaowork-watch-managed-v1"
+TLS_NAME = "xiaowork-watch"
+TLS_SERVICE = "xiaowork-watch-certbot-renew.service"
+TLS_TIMER = "xiaowork-watch-certbot-renew.timer"
+ACME_SERVER = "https://acme-v02.api.letsencrypt.org/directory"
+HTTPS_PORT = 443
+CERTBOT_SYSTEM_CONFIG = Path("/etc/letsencrypt/cli.ini")
 
 
 class ConsoleError(ValueError):
@@ -30,6 +42,8 @@ class Paths:
     wrapper: Path = Path("/usr/local/bin/xiaowork-watch")
     service: Path = Path("/etc/systemd/system/xiaowork-watch-update.service")
     timer: Path = Path("/etc/systemd/system/xiaowork-watch-update.timer")
+    tls_service: Path = Path("/etc/systemd/system/" + TLS_SERVICE)
+    tls_timer: Path = Path("/etc/systemd/system/" + TLS_TIMER)
 
 
 DEFAULT_PATHS = Paths()
@@ -55,10 +69,15 @@ Persistent=true
 WantedBy=timers.target"""
 
 
-def _run(arguments):
+def _run(arguments, timeout=30):
     try:
+        if timeout > 30:
+            print("正在执行：" + " ".join(arguments[:3]) + "，请稍候……", flush=True)
+        environment = os.environ.copy()
+        environment["DEBIAN_FRONTEND"] = "noninteractive"
         result = subprocess.run(arguments, check=True, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
+                                stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                                universal_newlines=True, timeout=timeout, env=environment)
         return result.stdout + result.stderr
     except subprocess.CalledProcessError as error:
         detail = (error.stderr or error.stdout or str(error)).strip()
@@ -73,7 +92,8 @@ def _read_regular(path):
         raise ConsoleError("拒绝操作非普通文件或符号链接：" + str(path))
     if path.stat().st_size > 1024 * 1024:
         raise ConsoleError("配置文件过大：" + str(path))
-    return path.read_text(encoding="utf-8")
+    with path.open("r", encoding="utf-8", newline="") as source:
+        return source.read()
 
 
 def _write(path, text, mode=0o644):
@@ -245,6 +265,9 @@ def configure_proxy(manager, domain, paths=DEFAULT_PATHS, locked=None):
     domain = _domain(domain)
     with _lock(manager, locked):
         config = manager._config()
+        prior_proxy = _read_regular(paths.nginx_proxy) if paths.nginx_proxy.exists() or paths.nginx_proxy.is_symlink() else ""
+        if config.get("httpsEnabled") or re.search(r"\bssl_certificate\b|\blisten\s+443\s+ssl\b", prior_proxy):
+            raise ConsoleError("此站点已配置 HTTPS；请使用菜单 8 管理 HTTPS，HTTP 入口不会降级它。")
         endpoint = urlsplit(config.get("healthUrl", ""))
         try:
             port = endpoint.port or 80
@@ -291,6 +314,366 @@ def configure_proxy(manager, domain, paths=DEFAULT_PATHS, locked=None):
     return {"domain": domain, "url": "http://" + domain + "/", "https": False}
 
 
+def _tls_domain(value):
+    value = _domain(value).lower()
+    if "." not in value or re.fullmatch(r"[0-9.]+", value):
+        raise ConsoleError("HTTPS 需要公开 DNS 域名，不能使用本地名称或 IP 地址。")
+    return value
+
+
+def _email(value):
+    if not isinstance(value, str) or len(value) > 254 or value.count("@") != 1:
+        raise ConsoleError("请输入有效的联系邮箱。")
+    local, domain = value.split("@")
+    if (not 1 <= len(local) <= 64 or not re.fullmatch(r"[A-Za-z0-9._%+-]+", local)
+            or local.startswith((".", "-")) or local.endswith(".") or ".." in local):
+        raise ConsoleError("联系邮箱含有无效字符。")
+    _tls_domain(domain)
+    return value
+
+
+def _nginx_path(path):
+    value = str(path)
+    if "\r" in value or "\n" in value:
+        raise ConsoleError("配置路径含有无效字符。")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _public_directory(path, root):
+    parts = path.relative_to(root).parts
+    for length in range(len(parts) + 1):
+        directory = root.joinpath(*parts[:length])
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            raise ConsoleError("目录不安全，已保留：" + str(directory))
+        directory.mkdir(exist_ok=True)
+        os.chmod(str(directory), 0o755)
+
+
+def _tls_directories(manager, create=False):
+    shared = manager.root / "shared"
+    names = {"certs": "letsencrypt", "work": "certbot-work", "logs": "certbot-logs", "acme": "acme"}
+    folders = {key: shared / name for key, name in names.items()}
+    if shared.is_symlink() or (shared.exists() and not shared.is_dir()):
+        raise ConsoleError("共享目录不安全。")
+    for key in ("certs", "work", "logs"):
+        folder = folders[key]
+        marker = folder / ".xiaowork-watch-owned"
+        if folder.is_symlink() or (folder.exists() and not folder.is_dir()):
+            raise ConsoleError("证书目录不安全：" + str(folder))
+        if marker.exists() or marker.is_symlink():
+            if _read_regular(marker) != _header(manager):
+                raise ConsoleError("证书目录属于其他安装，已保留：" + str(folder))
+        elif folder.exists() and any(folder.iterdir()):
+            raise ConsoleError("证书目录已有未标记的数据，已保留：" + str(folder))
+    for directory in (folders["acme"], folders["acme"] / ".well-known", folders["acme"] / ".well-known/acme-challenge"):
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            raise ConsoleError("ACME 验证目录不安全。")
+    if create:
+        _public_directory(folders["acme"] / ".well-known/acme-challenge", manager.root)
+        for key in ("certs", "work", "logs"):
+            folder = folders[key]
+            folder.mkdir(exist_ok=True)
+            os.chmod(str(folder), 0o700)
+            marker = folder / ".xiaowork-watch-owned"
+            if not marker.exists():
+                _write(marker, _header(manager), 0o600)
+    return folders
+
+
+def _upstream(config):
+    endpoint = urlsplit(config.get("healthUrl", ""))
+    try:
+        port = endpoint.port or 80
+    except ValueError as error:
+        raise ConsoleError("本地网站端口无效。") from error
+    if (endpoint.scheme != "http" or endpoint.hostname not in ("127.0.0.1", "localhost", "::1")
+            or endpoint.username or endpoint.password or port in (80, HTTPS_PORT) or not 1 <= port <= 65535):
+        raise ConsoleError("HTTPS 反代需要独立的本地 HTTP 网站端口，例如 8088。")
+    host = _domain(config["healthHost"]) if config.get("healthHost") else "127.0.0.1"
+    return port, host
+
+
+def _proxy_location(port, host):
+    return ("    location / {\n        proxy_pass http://127.0.0.1:" + str(port) + ";\n"
+            "        proxy_set_header Host " + host + ";\n"
+            "        proxy_set_header X-Real-IP $remote_addr;\n"
+            "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
+            "        proxy_set_header X-Forwarded-Proto $scheme;\n    }\n")
+
+
+def _tls_proxy(manager, domain, config, folders, tls_domain=None, http_domains=None):
+    port, host = _upstream(config)
+    domains = http_domains or domain
+    conf = (_header(manager) + "server {\n    listen 80;\n    server_name " + domains + ";\n"
+            "    location ^~ /.well-known/acme-challenge/ {\n        root " + _nginx_path(folders["acme"]) + ";\n"
+            "        default_type text/plain;\n        try_files $uri =404;\n    }\n")
+    if tls_domain:
+        conf += "    location / { return 301 https://" + tls_domain + "$request_uri; }\n}\n"
+        live = folders["certs"] / "live" / TLS_NAME
+        conf += ("server {\n    listen 443 ssl;\n    server_name " + tls_domain + ";\n"
+                 "    ssl_certificate " + _nginx_path(live / "fullchain.pem") + ";\n"
+                 "    ssl_certificate_key " + _nginx_path(live / "privkey.pem") + ";\n"
+                 "    ssl_protocols TLSv1.2 TLSv1.3;\n" + _proxy_location(port, host) + "}\n")
+    else:
+        conf += _proxy_location(port, host) + "}\n"
+    return conf
+
+
+def _nginx_reload():
+    check = _run(["nginx", "-t"])
+    if "conflicting server name" in check.lower():
+        raise ConsoleError("Nginx 报告域名冲突；已保留原站点配置。")
+    _run(["systemctl", "reload", "nginx"])
+
+
+def _certificate_target(folders, name):
+    certs = folders["certs"]
+    for directory in (certs / "archive", certs / "archive" / TLS_NAME, certs / "live", certs / "live" / TLS_NAME):
+        if directory.is_symlink() or not directory.is_dir():
+            raise ConsoleError("证书目录无效或包含目录链接。")
+    live = certs / "live" / TLS_NAME / name
+    try:
+        target = live.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ConsoleError("证书文件不存在：" + name) from error
+    prefix = name[:-4]
+    if (target.parent != certs / "archive" / TLS_NAME
+            or not re.fullmatch(re.escape(prefix) + r"[0-9]+\.pem", target.name)
+            or not target.is_file() or not stat.S_ISREG(target.stat().st_mode)
+            or not 0 < target.stat().st_size <= 4 * 1024 * 1024):
+        raise ConsoleError("证书文件必须位于本安装专属的 archive lineage。")
+    return live
+
+
+def _certificate_snapshot(folders):
+    snapshot = {"links": {}, "renewal": None}
+    live = folders["certs"] / "live" / TLS_NAME
+    if live.exists() or live.is_symlink():
+        for name in ("cert.pem", "chain.pem", "fullchain.pem", "privkey.pem"):
+            path = live / name
+            if path.exists() or path.is_symlink():
+                _certificate_target(folders, name)
+                snapshot["links"][name] = path.resolve(strict=True)
+    renewal = folders["certs"] / "renewal" / (TLS_NAME + ".conf")
+    if renewal.parent.is_symlink():
+        raise ConsoleError("证书续期配置目录不能是符号链接。")
+    if renewal.exists() or renewal.is_symlink():
+        snapshot["renewal"] = (_read_regular(renewal), stat.S_IMODE(renewal.stat().st_mode))
+    return snapshot
+
+
+def _restore_certificate_snapshot(folders, snapshot):
+    # Preserve new archives/accounts; restore only the prior owned lineage links.
+    live = folders["certs"] / "live" / TLS_NAME
+    for name, target in snapshot["links"].items():
+        temporary = live / (".restore-" + secrets.token_hex(8))
+        try:
+            temporary.symlink_to(os.path.relpath(str(target), str(live)))
+            os.replace(str(temporary), str(live / name))
+        finally:
+            if temporary.is_symlink():
+                temporary.unlink()
+    if snapshot["renewal"] is not None:
+        renewal = folders["certs"] / "renewal" / (TLS_NAME + ".conf")
+        _write(renewal, snapshot["renewal"][0], snapshot["renewal"][1])
+
+
+def _validate_certificates(folders, domain):
+    cert = _certificate_target(folders, "fullchain.pem")
+    key = _certificate_target(folders, "privkey.pem")
+    matched = _run(["openssl", "x509", "-in", str(cert), "-checkhost", domain, "-noout"])
+    if ("Hostname " + domain + " does match certificate") not in matched.splitlines():
+        raise ConsoleError("签发的证书不匹配所选域名。")
+    _run(["openssl", "x509", "-in", str(cert), "-checkend", "0", "-noout"])
+    return cert, key
+
+
+class _LoopbackHTTPS(http.client.HTTPSConnection):
+    def connect(self):
+        connection = socket.create_connection(("127.0.0.1", self.port), self.timeout)
+        try:
+            self.sock = self._context.wrap_socket(connection, server_hostname=self.host)
+        except BaseException:
+            connection.close()
+            raise
+
+
+def _https_health(manager, domain):
+    sha = manager._pointed_sha("current")
+    if not sha:
+        raise ConsoleError("当前没有已安装的网站版本。")
+    last_error = None
+    for attempt in range(3):
+        connection = _LoopbackHTTPS(domain, HTTPS_PORT, timeout=10, context=ssl.create_default_context())
+        try:
+            connection.request("GET", "/release.json?_tls=" + sha,
+                               headers={"Host": domain, "Cache-Control": "no-cache"})
+            response = connection.getresponse()
+            raw = response.read(1024 * 1024 + 1)
+            value = json.loads(raw) if len(raw) <= 1024 * 1024 else None
+            if (response.status == 200 and isinstance(value, dict) and type(value.get("schema")) is int
+                    and value["schema"] == 1 and value.get("commit") == sha and value.get("kind") == "frontend-prototype"):
+                return
+            last_error = "HTTPS 未返回当前网站版本"
+        except Exception as error:
+            last_error = str(error)
+        finally:
+            connection.close()
+        if attempt < 2:
+            time.sleep(0.5)
+    raise ConsoleError("HTTPS 本地证书与版本检查失败：" + str(last_error))
+
+
+def _certbot_arguments(folders):
+    return ["--config", "/dev/null", "--server", ACME_SERVER, "--no-directory-hooks",
+            "--config-dir", str(folders["certs"]), "--work-dir", str(folders["work"]),
+            "--logs-dir", str(folders["logs"])]
+
+
+def _check_certbot_defaults():
+    # --config /dev/null does not replace Certbot's default config file list.
+    # Match its expanduser/glob behavior, including an explicitly empty XDG value.
+    patterns = (str(CERTBOT_SYSTEM_CONFIG),
+                os.path.join(os.environ.get("XDG_CONFIG_HOME", "~/.config"), "letsencrypt", "cli.ini"))
+    for pattern in patterns:
+        for candidate in glob.glob(os.path.expanduser(pattern)):
+            path = Path(candidate)
+            try:
+                text = _read_regular(path)
+            except (ConsoleError, OSError, UnicodeError) as error:
+                raise ConsoleError("无法安全读取默认 Certbot 配置，已保留文件并停止：" + str(path)) from error
+            if any(line.strip() and not line.strip().startswith(("#", ";")) for line in text.splitlines()):
+                raise ConsoleError("检测到已有全局 Certbot 配置，已保留文件并停止，未执行证书申请或全局 hooks：" + str(path))
+
+
+def _unit_state(name, query):
+    try:
+        result = _run(["systemctl", query, name]).strip()
+    except ConsoleError as error:
+        result = str(error).splitlines()[-1].strip()
+        if result not in ("disabled", "inactive", "failed", "not-found"):
+            raise
+    if query == "is-enabled":
+        return result in ("enabled", "enabled-runtime")
+    return result in ("active", "activating")
+
+
+def _tls_units(manager):
+    service = (_header(manager) + "[Unit]\nDescription=Renew xiaowork Watch HTTPS certificate\n"
+               "Wants=network-online.target\nAfter=network-online.target nginx.service\n\n"
+               "[Service]\nType=oneshot\nExecStart=/usr/local/bin/xiaowork-watch renew-https\nTimeoutStartSec=900\n")
+    timer = (_header(manager) + "[Unit]\nDescription=Check xiaowork Watch HTTPS certificate daily\n\n"
+             "[Timer]\nOnCalendar=daily\nRandomizedDelaySec=1h\nPersistent=true\n\n"
+             "[Install]\nWantedBy=timers.target\n")
+    return service, timer
+
+
+def configure_https(manager, domain, email, paths=DEFAULT_PATHS, locked=None):
+    domain, email = _tls_domain(domain), _email(email)
+    with _lock(manager, locked):
+        config = manager._config()
+        _upstream(config)
+        if not _owned(paths.wrapper, manager, "wrapper", paths):
+            raise ConsoleError("未找到此安装的管理命令，无法配置证书续期服务。")
+        if not _owned(paths.nginx_site, manager, "site", paths):
+            raise ConsoleError("未找到属于此安装的 Nginx 网站配置。")
+        for path, kind in ((paths.nginx_proxy, "proxy"), (paths.tls_service, "tls-service"), (paths.tls_timer, "tls-timer")):
+            _require_owned(path, manager, kind, paths)
+        tracked = (paths.nginx_proxy, paths.tls_service, paths.tls_timer, manager.root / "config.json")
+        snapshots = {path: (_read_regular(path), stat.S_IMODE(path.stat().st_mode))
+                     for path in tracked if path.exists()}
+        old_proxy = snapshots.get(paths.nginx_proxy, ("",))[0]
+        was_tls = bool(config.get("httpsEnabled"))
+        if re.search(r"\bssl_certificate\b", old_proxy) and not was_tls:
+            raise ConsoleError("已有 HTTPS 配置未登记为本工具管理，已保留；请先检查证书归属。")
+        _check_certbot_defaults()
+        folders = _tls_directories(manager, create=True)
+        certificate_state = _certificate_snapshot(folders)
+        prior_domain = _tls_domain(config.get("tlsDomain") or config.get("proxyDomain")) if was_tls else None
+        if prior_domain:
+            # Expired old certificates may still be renewed by this operation.
+            _certificate_target(folders, "fullchain.pem")
+            _certificate_target(folders, "privkey.pem")
+        enabled = _unit_state(TLS_TIMER, "is-enabled") if paths.tls_timer in snapshots else False
+        active = _unit_state(TLS_TIMER, "is-active") if paths.tls_timer in snapshots else False
+        timer_touched = False
+        try:
+            if not shutil.which("certbot") or not shutil.which("openssl"):
+                _run(["apt-get", "update"], timeout=600)
+                _run(["apt-get", "install", "-y", "certbot", "openssl"], timeout=600)
+            if not shutil.which("certbot") or not shutil.which("openssl"):
+                raise ConsoleError("Certbot 或 OpenSSL 安装后仍不可用。")
+            # A package installation may have created a default cli.ini.
+            _check_certbot_defaults()
+            print("正在准备 IPv4 HTTP-01 验证；域名 A 记录需指向服务器且不应保留无效 AAAA，已有 HTTPS 会继续提供服务。", flush=True)
+            domains = " ".join(dict.fromkeys((prior_domain, domain))) if prior_domain else domain
+            _write(paths.nginx_proxy, _tls_proxy(manager, domain, config, folders, tls_domain=prior_domain, http_domains=domains))
+            _nginx_reload()
+            print("正在向 Let's Encrypt 申请或检查证书，可能需要几分钟。", flush=True)
+            arguments = ["certbot", "certonly"] + _certbot_arguments(folders) + [
+                "--cert-name", TLS_NAME, "--keep-until-expiring", "--renew-with-new-domains",
+                "--non-interactive", "--agree-tos", "--email", email, "--preferred-challenges", "http",
+                "--webroot", "-w", str(folders["acme"]), "-d", domain]
+            _run(arguments, timeout=600)
+            _validate_certificates(folders, domain)
+            _write(paths.nginx_proxy, _tls_proxy(manager, domain, config, folders, tls_domain=domain))
+            _nginx_reload()
+            _https_health(manager, domain)
+            service, timer = _tls_units(manager)
+            _write(paths.tls_service, service)
+            _write(paths.tls_timer, timer)
+            _run(["systemctl", "daemon-reload"])
+            config.update({"proxyDomain": domain, "httpsEnabled": True, "tlsDomain": domain,
+                           "tlsEmail": email, "tlsCertName": TLS_NAME})
+            _write_config(manager, config)
+            timer_touched = True
+            _run(["systemctl", "enable", "--now", TLS_TIMER])
+        except BaseException:
+            if timer_touched:
+                try:
+                    _run(["systemctl", "disable", "--now", TLS_TIMER])
+                except ConsoleError:
+                    pass
+            _restore_certificate_snapshot(folders, certificate_state)
+            for path in tracked:
+                if path in snapshots:
+                    _write(path, snapshots[path][0], snapshots[path][1])
+                elif path.exists():
+                    path.unlink()
+            for arguments in (["systemctl", "daemon-reload"], ["nginx", "-t"], ["systemctl", "reload", "nginx"]):
+                try:
+                    _run(arguments)
+                except ConsoleError:
+                    pass
+            if paths.tls_timer in snapshots:
+                try:
+                    _run(["systemctl", "enable" if enabled else "disable", TLS_TIMER])
+                    _run(["systemctl", "start" if active else "stop", TLS_TIMER])
+                except ConsoleError:
+                    pass
+            raise
+    return {"domain": domain, "url": "https://" + domain + "/", "https": True}
+
+
+def renew_https(manager, paths=DEFAULT_PATHS, locked=None):
+    with _lock(manager, locked):
+        config = manager._config()
+        if not config.get("httpsEnabled"):
+            raise ConsoleError("此安装尚未配置 HTTPS。")
+        domain = _tls_domain(config.get("tlsDomain") or config.get("proxyDomain"))
+        for path, kind in ((paths.nginx_proxy, "proxy"), (paths.tls_service, "tls-service"), (paths.tls_timer, "tls-timer")):
+            if not _owned(path, manager, kind, paths):
+                raise ConsoleError("HTTPS 续期配置不属于此安装：" + str(path))
+        _check_certbot_defaults()
+        folders = _tls_directories(manager)
+        _run(["certbot", "renew"] + _certbot_arguments(folders) + [
+            "--cert-name", TLS_NAME, "--quiet", "--non-interactive"], timeout=600)
+        _validate_certificates(folders, domain)
+        _nginx_reload()
+        _https_health(manager, domain)
+    return {"status": "checked", "domain": domain}
+
+
 def _internal_uninstall_targets(manager):
     # Verify all paths before disabling anything. Root and download data remain.
     for name in ("current", "previous"):
@@ -324,21 +707,34 @@ def uninstall(manager, confirm=False, paths=DEFAULT_PATHS, locked=None):
         return {"status": "cancelled", "dataRetained": True}
     with _lock(manager, locked):
         global_paths = [(paths.nginx_site, "site"), (paths.nginx_proxy, "proxy"),
-                        (paths.wrapper, "wrapper"), (paths.service, "service"), (paths.timer, "timer")]
+                        (paths.wrapper, "wrapper"), (paths.service, "service"), (paths.timer, "timer"),
+                        (paths.tls_service, "tls-service"), (paths.tls_timer, "tls-timer")]
         for path, kind in global_paths:
             _require_owned(path, manager, kind, paths)
         internal = _internal_uninstall_targets(manager)
         snapshots = {path: (_read_regular(path), stat.S_IMODE(path.stat().st_mode))
                      for path, _ in global_paths if path.exists()}
         config = manager._config()
-        config["autoUpdate"] = False
-        _write_config(manager, config)
-        if paths.timer in snapshots:
-            _run(["systemctl", "disable", "--now", "xiaowork-watch-update.timer"])
-        if paths.service in snapshots:
-            _run(["systemctl", "stop", "xiaowork-watch-update.service"])
+        config_path = manager.root / "config.json"
+        old_config = (_read_regular(config_path), stat.S_IMODE(config_path.stat().st_mode))
+        timer_states = {}
+        for path, name in ((paths.timer, "xiaowork-watch-update.timer"), (paths.tls_timer, TLS_TIMER)):
+            if path in snapshots:
+                timer_states[name] = (_unit_state(name, "is-enabled"), _unit_state(name, "is-active"))
         removed = []
         try:
+            config["autoUpdate"] = False
+            if "httpsEnabled" in config:
+                config["httpsEnabled"] = False
+            _write_config(manager, config)
+            if paths.timer in snapshots:
+                _run(["systemctl", "disable", "--now", "xiaowork-watch-update.timer"])
+            if paths.service in snapshots:
+                _run(["systemctl", "stop", "xiaowork-watch-update.service"])
+            if paths.tls_timer in snapshots:
+                _run(["systemctl", "disable", "--now", TLS_TIMER])
+            if paths.tls_service in snapshots:
+                _run(["systemctl", "stop", TLS_SERVICE])
             for path in (paths.nginx_site, paths.nginx_proxy):
                 if path in snapshots:
                     path.unlink()
@@ -346,20 +742,28 @@ def uninstall(manager, confirm=False, paths=DEFAULT_PATHS, locked=None):
             if removed:
                 _run(["nginx", "-t"])
                 _run(["systemctl", "reload", "nginx"])
-            for path in (paths.service, paths.timer, paths.wrapper):
+            for path in (paths.service, paths.timer, paths.tls_service, paths.tls_timer, paths.wrapper):
                 if path in snapshots:
                     path.unlink()
                     removed.append(path)
-            if paths.service in snapshots or paths.timer in snapshots:
+            if any(path in snapshots for path in (paths.service, paths.timer, paths.tls_service, paths.tls_timer)):
                 _run(["systemctl", "daemon-reload"])
         except BaseException:
             for path in removed:
                 _write(path, snapshots[path][0], snapshots[path][1])
+            _write(config_path, old_config[0], old_config[1])
             for command in (["systemctl", "daemon-reload"], ["nginx", "-t"], ["systemctl", "reload", "nginx"]):
                 try:
                     _run(command)
                 except ConsoleError:
                     pass
+            for name, (enabled, active) in timer_states.items():
+                for command in (["systemctl", "enable" if enabled else "disable", name],
+                                ["systemctl", "start" if active else "stop", name]):
+                    try:
+                        _run(command)
+                    except ConsoleError:
+                        pass
             raise
         internal.sort(key=lambda path: 0 if path.name in ("current", "previous", "control") else 1)
         for path in internal:
@@ -403,7 +807,8 @@ def _status_text(manager):
     return ("当前版本：" + version(status.get("current"))
             + "\n可回退版本：" + version(status.get("previous"))
             + "\n自动更新：" + ("开启" if status.get("autoUpdate", True) else "暂停")
-            + "\n反代域名：" + str(config.get("proxyDomain") or "未配置"))
+            + "\n反代域名：" + str(config.get("proxyDomain") or "未配置")
+            + "\nHTTPS：" + ("已配置（独立自动续期）" if config.get("httpsEnabled") else "未配置"))
 
 
 def run_menu(manager, locked, paths=DEFAULT_PATHS):
@@ -414,7 +819,7 @@ def run_menu(manager, locked, paths=DEFAULT_PATHS):
         return 1
     with terminal:
         while True:
-            _say(terminal, "\n========== xiaowork Watch ==========\n服务器管理\n\n  1. 查看状态\n  2. 配置域名 HTTP 反代\n  3. 更新网站\n  4. 回退上一版本\n  5. 自动更新开关\n  6. 查看更新日志\n  7. 卸载网站入口（保留下载数据）\n  0. 退出\n")
+            _say(terminal, "\n========== xiaowork Watch ==========\n服务器管理\n\n  1. 查看状态\n  2. 配置域名 HTTP 反代\n  3. 更新网站\n  4. 回退上一版本\n  5. 自动更新开关\n  6. 查看更新日志\n  7. 卸载网站入口（保留下载数据）\n  8. 配置 HTTPS\n  0. 退出\n")
             choice = _ask(terminal, "请选择：")
             if choice in (None, "0"):
                 return 0
@@ -455,6 +860,26 @@ def run_menu(manager, locked, paths=DEFAULT_PATHS):
                         _say(terminal, "卸载完成，下载数据与安装配置已保留。可重新执行安装链接。")
                         return 0
                     _say(terminal, "已取消卸载。")
+                elif choice == "8":
+                    default = manager._config().get("proxyDomain", "")
+                    entered = _ask(terminal, "HTTPS 域名" + (" [" + default + "]" if default else "") + "（Enter 接受默认）：")
+                    if entered is None:
+                        continue
+                    domain = entered or default
+                    if not domain:
+                        _say(terminal, "已取消；HTTPS 需要域名。")
+                        continue
+                    email = _ask(terminal, "联系邮箱（必填，留空取消）：")
+                    if not email:
+                        _say(terminal, "已取消；联系邮箱不能为空。")
+                        continue
+                    domain, email = _tls_domain(domain), _email(email)
+                    _say(terminal, "请确认域名 A 记录已指向此服务器，当前入口仅支持 IPv4，请移除该域名的 AAAA；80/443 端口已开放，并同意 Let's Encrypt 服务条款：https://letsencrypt.org/repository/")
+                    if _ask(terminal, "输入 YES 确认并申请证书：") != "YES":
+                        _say(terminal, "已取消 HTTPS 配置。")
+                        continue
+                    result = configure_https(manager, domain, email, paths=paths, locked=locked)
+                    _say(terminal, "HTTPS 已配置：" + result["url"] + "\n专用证书续期任务已开启，暂停网站自动更新不影响续期。")
                 else:
                     _say(terminal, "请选择菜单中的编号。")
             except Exception as error:

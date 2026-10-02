@@ -532,6 +532,11 @@ def main(argv=None):
     proxy.add_argument("domain")
     automatic = commands.add_parser("auto-update", help="Enable or pause automatic updates")
     automatic.add_argument("state", choices=("on", "off"))
+    secure = commands.add_parser("https", help="Configure HTTPS with a Let's Encrypt certificate")
+    secure.add_argument("domain")
+    secure.add_argument("--email", required=True, help="Contact email for the certificate account")
+    secure.add_argument("--agree-tos", action="store_true", help="Explicitly agree to Let's Encrypt terms")
+    commands.add_parser("renew-https", help="Renew this deployment's certificate and reload Nginx")
     removal = commands.add_parser("uninstall", help="Remove this deployment's service entries; keep downloaded data")
     removal.add_argument("--confirm", action="store_true", help="Explicitly confirm removal without an interactive menu")
     args = parser.parse_args(argv)
@@ -546,7 +551,7 @@ def main(argv=None):
             sys.modules[specification.name] = console
             specification.loader.exec_module(console)
             console.ensure_control_entry(manager, locked=_locked)
-        if args.command in (None, "menu", "proxy", "auto-update", "uninstall"):
+        if args.command in (None, "menu", "proxy", "auto-update", "https", "renew-https", "uninstall"):
             if console is None:
                 raise DeploymentError("Menu tools are unavailable. Update or run the latest install.sh to open the menu.")
             if args.command in (None, "menu"):
@@ -555,6 +560,12 @@ def main(argv=None):
                 result = console.configure_proxy(manager, args.domain, locked=_locked)
             elif args.command == "auto-update":
                 result = console.set_auto_update(manager, args.state == "on", locked=_locked)
+            elif args.command == "https":
+                if not args.agree_tos:
+                    raise DeploymentError("申请证书前须同意 Let's Encrypt 服务条款；请在菜单中确认，或显式添加 --agree-tos。")
+                result = console.configure_https(manager, args.domain, args.email, locked=_locked)
+            elif args.command == "renew-https":
+                result = console.renew_https(manager, locked=_locked)
             else:
                 result = console.uninstall(manager, confirm=args.confirm, locked=_locked)
             print(json.dumps(result, sort_keys=True, ensure_ascii=False))

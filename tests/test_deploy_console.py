@@ -70,7 +70,7 @@ class ConsoleTests(unittest.TestCase):
         self.system.mkdir()
         self.manager = FakeManager(self.root)
         self.paths = console.Paths(**{name: self.system / name for name in (
-            "nginx_site", "nginx_proxy", "wrapper", "service", "timer")})
+            "nginx_site", "nginx_proxy", "wrapper", "service", "timer", "tls_service", "tls_timer")})
         self.locked_paths = []
         self.inside_lock = False
         self.write_config()

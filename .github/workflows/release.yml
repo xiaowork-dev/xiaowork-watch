@@ -31,6 +31,10 @@ jobs:
           package-manager-cache: false
       - name: Install dependencies
         run: npm ci
+      - name: Install local Nginx test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nginx openssl
       - name: Test installer and updater
         run: |
           bash -n install.sh

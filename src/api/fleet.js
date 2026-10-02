@@ -5,24 +5,9 @@ const KEY = 'xiaowork-watch-fleet-v1'
 const clone = value => JSON.parse(JSON.stringify(value))
 const wait = () => new Promise(resolve => setTimeout(resolve, 120))
 const now = () => new Date().toISOString()
-export function createFleetSeed(time = Date.now()) {
- const stamp = seconds => new Date(time - seconds * 1000).toISOString()
- const nodes = [
-  { id: 1, name: '上海测试节点', region: '中国 · 上海', enabled: true, agentState: 'ONLINE', lastSeenAt: stamp(15) },
-  { id: 2, name: '东京测试节点', region: '日本 · 东京', enabled: true, agentState: 'ONLINE', lastSeenAt: stamp(20) },
-  { id: 3, name: '法兰克福测试节点', region: '德国 · 法兰克福', enabled: true, agentState: 'OFFLINE', lastSeenAt: stamp(3600) },
- ]
- const hosts = [
-  { id: 1, name: '香港 VPS', address: '192.0.2.10', region: '中国 · 香港', enabled: true, nodeIds: [1, 2, 3], agentState: 'ONLINE', lastSeenAt: stamp(12) },
-  { id: 2, name: '洛杉矶 VPS', address: '198.51.100.20', region: '美国 · 洛杉矶', enabled: true, nodeIds: [1, 2], agentState: 'OFFLINE', lastSeenAt: stamp(900) },
-  { id: 3, name: '新加坡 VPS', address: '203.0.113.30', region: '新加坡', enabled: true, nodeIds: [1, 2], agentState: 'PENDING', lastSeenAt: null },
- ]
- const results = []
- for (const host of hosts.slice(0, 2)) for (const node of nodes.filter(n => host.nodeIds.includes(n.id))) for (let i = 0; i < 8; i++) {
-  const fail = host.id === 2 && node.id === 1
-  results.push({ id: `seed-${host.id}-${node.id}-${i}`, hostId: host.id, nodeId: node.id, nodeName: node.name, region: node.region, sent: 5, received: fail ? 0 : 5, avgRttMs: fail ? null : host.id === 1 ? (node.id === 1 ? 38 : 64) + i * 2 : 146 + i * 2, status: fail ? 'TIMEOUT' : 'OK', checkedAt: stamp(node.id === 3 ? 3600 + i * 60 : 30 + i * 60) })
- }
- return { version: 1, nextHostId: 4, nextNodeId: 4, hosts, nodes, results }
+export function createFleetSeed() {
+ // Keep the storage key/version so prior user additions and edits are never reset.
+ return { version: 1, nextHostId: 1, nextNodeId: 1, hosts: [], nodes: [], results: [] }
 }
 function save(db) { try { localStorage.setItem(KEY, JSON.stringify(db)) } catch { throw new Error('示例数据保存失败，请允许浏览器使用本地存储。') } }
 function load() {
