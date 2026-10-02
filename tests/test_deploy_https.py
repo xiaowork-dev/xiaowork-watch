@@ -137,10 +137,14 @@ class HttpsTests(unittest.TestCase):
             self.certificates(self.issue_version)
         if arguments[:3] == ["apt-get", "install", "-y"]:
             self.tools = True
-        if arguments == ["systemctl", "is-enabled", console.TLS_TIMER]:
-            return "enabled" if self.timer_enabled else "disabled"
-        if arguments == ["systemctl", "is-active", console.TLS_TIMER]:
-            return "active" if self.timer_active else "inactive"
+        if arguments[:3] == ["systemctl", "show", console.TLS_TIMER]:
+            if "--property=UnitFileState" in arguments:
+                return "LoadState=loaded\nUnitFileState=" + ("enabled" if self.timer_enabled else "disabled")
+            return "LoadState=loaded\nActiveState=" + ("active" if self.timer_active else "inactive")
+        if arguments[:2] == ["systemctl", "show"]:
+            if "--property=UnitFileState" in arguments:
+                return "LoadState=loaded\nUnitFileState=enabled"
+            return "LoadState=loaded\nActiveState=active"
         if arguments[:3] == ["systemctl", "enable", "--now"] and arguments[-1] == console.TLS_TIMER:
             self.timer_enabled = self.timer_active = True
         if arguments[:3] == ["systemctl", "disable", "--now"] and arguments[-1] == console.TLS_TIMER:

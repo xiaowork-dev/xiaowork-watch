@@ -20,9 +20,9 @@ import unittest
 
 GUARD = "[[ ${EUID} -eq 0 ]]"
 PROBE = """
-printf '\\n__INSTALLER_DECISION__:%s|%s|%s|%s|%s|%s|%s|%s\\n' \\
+printf '\\n__INSTALLER_DECISION__:%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' \\
  "$action" "$non_interactive" "$show_after_install" "$installed" \\
- "$listen_port" "$server_name" "$deploy_root" "$confirm_uninstall"
+ "$listen_port" "$server_name" "$deploy_root" "$confirm_uninstall" "$purge_data"
 """
 
 
@@ -43,6 +43,20 @@ def decision_stage(source):
     if re.search(r"^apt-get(?:\s|$)", stage, flags=re.MULTILINE):
         raise RuntimeError("Package installation appeared before the decision-stage boundary.")
     return stage + PROBE
+
+
+def management_function(source):
+    start = "run_management() ("
+    boundary = '\nif [[ "$action" == menu ]]; then'
+    if source.count(start) != 1:
+        raise RuntimeError("Installer must have exactly one management function.")
+    remainder = source.split(start, 1)[1]
+    if boundary not in remainder:
+        raise RuntimeError("Cannot safely isolate management before the menu decision.")
+    definition = start + remainder.split(boundary, 1)[0]
+    if not definition.rstrip().endswith(")"):
+        raise RuntimeError("The isolated management function has an invalid boundary.")
+    return definition
 
 
 def bash_executable():
@@ -71,9 +85,9 @@ def parse_decision(output):
     if not match:
         raise AssertionError("Installer did not finish its decision stage: " + output)
     values = match.group(1).split("|")
-    if len(values) != 8:
+    if len(values) != 9:
         raise AssertionError("Unexpected decision probe output.")
-    names = ("action", "non_interactive", "show_after_install", "installed", "port", "domain", "path", "confirm")
+    names = ("action", "non_interactive", "show_after_install", "installed", "port", "domain", "path", "confirm", "purge")
     return dict(zip(names, values))
 
 
@@ -166,6 +180,17 @@ class InstallerDecisions(InstallerFixture):
         decision = parse_decision(self.combined(result))
         self.assertEqual(decision["action"], "uninstall")
         self.assertEqual(decision["confirm"], "true")
+        self.assertEqual(decision["purge"], "false")
+
+    def test_purge_is_only_accepted_for_explicit_uninstall(self):
+        result = self.run_without_tty(self.stage, self.arguments("--uninstall", "--purge", "--confirm"))
+        self.assertEqual(result.returncode, 0, self.combined(result))
+        self.assertEqual(parse_decision(self.combined(result))["purge"], "true")
+        for flags in (("--purge",), ("--install", "--purge"), ("--non-interactive", "--purge")):
+            with self.subTest(flags=flags):
+                result = self.run_without_tty(self.stage, self.arguments(*flags))
+                self.assertEqual(result.returncode, 2, self.combined(result))
+                self.assertNotIn("__INSTALLER_DECISION__", self.combined(result))
 
     def test_installed_non_interactive_maps_to_update_deploy_action(self):
         self.installed_fixture()
@@ -198,6 +223,71 @@ class InstallerDecisions(InstallerFixture):
         result = self.run_without_tty(self.stage, self.arguments("--non-interactive"))
         self.assertEqual(result.returncode, 0, self.combined(result))
         self.assertEqual(list(self.fixture.iterdir()), [])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Published-tool selection fixture requires Linux")
+    def test_uninstall_purge_uses_downloaded_tools_even_with_old_control_and_current(self):
+        # Both installed dispatch branches are valid. Uninstall must bypass
+        # them so cleanup fixes can work without a successful website update.
+        for name, sha in (("control", "a" * 40), ("current", "b" * 40)):
+            deployed = self.fixture / "releases" / sha / ".deploy"
+            deployed.mkdir(parents=True)
+            (deployed / "manage.py").write_text("OLD_INSTALLED_MANAGER\n", encoding="ascii")
+            (deployed / "console.py").write_text("# old console\n", encoding="ascii")
+            target = Path("releases") / sha
+            if name == "control":
+                target = target / ".deploy"
+            (self.fixture / name).symlink_to(target, target_is_directory=True)
+
+        binaries = self.root / "fake-bin"
+        binaries.mkdir()
+        downloaded = self.root / "downloaded-management"
+        downloaded.mkdir()
+        python_stub = binaries / "python3"
+        python_stub.write_text("""#!/bin/sh
+manager=$1
+shift
+IFS= read -r kind < "$manager"
+printf '__MANAGER_KIND__:%s\\n' "$kind"
+printf '__MANAGER_PATH__:%s\\n' "$manager"
+printf '__MANAGER_ARGS__:'
+for value in "$@"; do printf '%s|' "$value"; done
+printf '\\n'
+""", encoding="utf-8")
+        # Production uses a fixed /tmp template; keep the fixture's temporary
+        # directory inside this test rather than creating system-wide files.
+        mktemp_stub = binaries / "mktemp"
+        mktemp_stub.write_text("""#!/bin/sh
+[ "$#" -eq 2 ] && [ "$1" = '-d' ] && [ "$2" = '/tmp/xiaowork-watch-menu.XXXXXXXX' ] || exit 91
+printf '%s\\n' "$WATCH_TEST_DOWNLOAD_DIR"
+""", encoding="utf-8")
+        os.chmod(str(python_stub), 0o755)
+        os.chmod(str(mktemp_stub), 0o755)
+        harness = """set -Eeuo pipefail
+deploy_root=$1
+export PATH="$2:$PATH"
+export WATCH_TEST_DOWNLOAD_DIR=$3
+load_latest_scripts() {
+ printf '__DOWNLOADED_TO__:%s\\n' "$1"
+ printf 'LATEST_PUBLISHED_MANAGER\\n' > "$1/manage.py"
+ printf '# published console fixture\\n' > "$1/console.py"
+}
+""" + management_function(self.source) + "\nrun_management uninstall --confirm --purge\n"
+        result = subprocess.run(
+            [BASH, "--noprofile", "--norc", "-s", "--", str(self.fixture), str(binaries), str(downloaded)],
+            input=harness.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True, timeout=5)
+        output = self.combined(result)
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("__DOWNLOADED_TO__:" + str(downloaded), output)
+        self.assertIn("__MANAGER_KIND__:LATEST_PUBLISHED_MANAGER", output)
+        self.assertNotIn("__MANAGER_KIND__:OLD_INSTALLED_MANAGER", output)
+        self.assertIn("__MANAGER_PATH__:" + str(downloaded / "manage.py"), output)
+        self.assertIn("__MANAGER_ARGS__:--root|" + str(self.fixture) + "|uninstall|--confirm|--purge|", output)
+        self.assertEqual(output.count("__MANAGER_PATH__:"), 1)
+        for name in ("control", "current"):
+            self.assertTrue((self.fixture / name).is_symlink())
+        for sha in ("a" * 40, "b" * 40):
+            self.assertEqual((self.fixture / "releases" / sha / ".deploy/manage.py").read_text(encoding="ascii"), "OLD_INSTALLED_MANAGER\n")
 
 
 @unittest.skipUnless(sys.platform.startswith("linux") and BASH, "Linux controlling-pty semantics are required")
@@ -273,6 +363,7 @@ class InstallerTerminalDecisions(InstallerFixture):
         decision = parse_decision(output)
         self.assertEqual(decision["action"], "uninstall")
         self.assertEqual(decision["show_after_install"], "false")
+        self.assertEqual(decision["purge"], "true")
         self.assertEqual(list(self.fixture.iterdir()), [])
 
     def test_invalid_selection_reprompts_before_valid_choice(self):

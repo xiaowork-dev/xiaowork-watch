@@ -1,6 +1,6 @@
 # 服务器部署与 GitHub 自动更新
 
-当前 v0.2.3 提供两条部署路径：自己拉取源码构建，或通过中文终端菜单部署 GitHub 的发布包。两种方式部署的都是**前端交互原型**；尚无真实主控后端、数据库或 Linux VPS 探针。首次访问的网站、VPS、测试节点及检测历史为空，由自己添加。已有浏览器中的配置、历史和旧样例不会自动清除。
+当前 v0.2.4 提供两条部署路径：自己拉取源码构建，或通过中文终端菜单部署 GitHub 的发布包。两种方式部署的都是**前端交互原型**；尚无真实主控后端、数据库或 Linux VPS 探针。首次访问的网站、VPS、测试节点及检测历史为空，由自己添加。已有浏览器中的配置、历史和旧样例不会自动清除。
 
 ## 方式一：一键安装并自动更新
 
@@ -10,7 +10,7 @@
 curl -fsSL https://raw.githubusercontent.com/xiaowork-dev/xiaowork-watch/main/install.sh | sudo bash
 ```
 
-在 SSH 终端执行后，未安装时首先显示小菜单：**1. 部署 / 2. 卸载 / 0. 退出**。选择部署后，脚本安装 Nginx、Python 3、curl 和 CA 证书，下载最新完整的 GitHub 前端发布包，校验 SHA256，并启动自动更新定时器。成功后自动进入管理菜单。服务器不需要 Node.js，不需要把 SSH 私钥提供给 Codex 或配置 GitHub Secrets。
+在 SSH 终端执行后，未安装时首先显示小菜单：**1. 部署 / 2. 彻底卸载 xiaowork Watch / 0. 退出**。选择部署后，脚本安装 Nginx、Python 3、curl 和 CA 证书，下载最新完整的 GitHub 前端发布包，校验 SHA256，并启动自动更新定时器。成功后自动进入管理菜单。服务器不需要 Node.js，不需要把 SSH 私钥提供给 Codex 或配置 GitHub Secrets。
 
 安装后运行 `sudo xiaowork-watch` 或再次执行安装链接，即可打开管理菜单：查看状态、域名反代、更新、回退、自动更新开关、日志、卸载，以及 **8. 配置 HTTPS**。菜单输入从 `/dev/tty` 读取，支持 `curl | sudo bash`；无交互终端时不会默认开始部署。
 
@@ -80,7 +80,23 @@ sudo xiaowork-watch renew-https
 
 DNS 未生效、错误 AAAA 记录、80/443 未开放或已有域名站点冲突时，应先修正再尝试。证书签发与公网验证在自己 VPS 上执行；CI 仅使用本地临时证书检查 Nginx、反代和挑战路径。[Certbot 官方说明](https://eff-certbot.readthedocs.io/en/stable/using.html)介绍 webroot 验证与自动续期。
 
-卸载在菜单中选择后，需要再次输入 `UNINSTALL` 确认。卸载先校验各入口归属，停用网站自动更新和专用证书续期任务，再移除本项目的站点、反代、命令和 systemd 配置，以及当前/前一版/管理入口指针和安装完成标记。`releases/`、`shared/`（包含证书和账户）、`config.json` 与目录标记保留，方便重新部署；Nginx/Certbot 软件、其他站点、全局证书任务和手动源码部署目录保留。没有确认不会执行卸载。明确需要无交互卸载时可运行 `sudo xiaowork-watch uninstall --confirm`。
+### 彻底卸载
+
+管理菜单选择 **7. 彻底卸载 xiaowork Watch**，或运行 `sudo xiaowork-watch uninstall` 打开卸载确认。提示列出清理范围和安装目录，只需输入一次 `UNINSTALL`；输入 0、回车或断开输入会取消。
+
+完整卸载先核验入口和目录归属，停用本项目的网站更新和证书续期任务，再移除站点、反代、管理命令和 systemd 配置。随后清理本安装目录中的 `releases/`、`shared/`（包含证书和账户）、`config.json`、版本指针及目录标记。Nginx/Certbot 软件、其他站点、全局证书任务和手动源码部署目录保留。当前原型的监控配置在浏览器本地存储中，服务器卸载不会清除浏览器的数据。
+
+旧版本或 Nginx 已停止时，不必先更新网站，退出当前菜单后执行最新链接：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xiaowork-dev/xiaowork-watch/main/install.sh | sudo bash -s -- --uninstall --purge
+```
+
+自选安装目录加 `--path /自己的目录`。该方式从最新完整 GitHub Release 获取管理工具，仍要求输入 `UNINSTALL`。无交互终端时明确加 `--confirm`。
+
+如需保留发布包、配置和证书，使用 `sudo xiaowork-watch uninstall --confirm` 或安装链接只加 `--uninstall`。明确无人值守彻底清理时使用 `sudo xiaowork-watch uninstall --purge --confirm`。
+
+等待更新或证书续期释放锁时会显示提示。Nginx 已停止时只检查配置，不尝试启动或重载。清理前发现未知文件、外部链接或挂载目录会停止并显示具体路径；入口操作失败会恢复原配置和定时任务。删除安装目录失败时会明确说明入口已卸载及残留数据的位置，便于检查后处理，不会显示完整卸载成功。
 
 程序存储结构：
 

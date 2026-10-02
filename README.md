@@ -1,6 +1,6 @@
 # xiaowork Watch
 
-面向个人开发者的 网站与 VPS 监控平台。本次交付为 v0.2.3 **可交互的前端原型**，采用 Vue 3 + Vite + Axios；实际后端仍按开发文档规划使用 Java 21 + Spring Boot + MySQL 8 + MyBatis-Plus。
+面向个人开发者的 网站与 VPS 监控平台。本次交付为 v0.2.4 **可交互的前端原型**，采用 Vue 3 + Vite + Axios；实际后端仍按开发文档规划使用 Java 21 + Spring Boot + MySQL 8 + MyBatis-Plus。
 
 ## 原型范围
 
@@ -33,7 +33,15 @@ npm run dev
 curl -fsSL https://raw.githubusercontent.com/xiaowork-dev/xiaowork-watch/main/install.sh | sudo bash
 ```
 
-首次显示“部署 / 卸载 / 退出”；选择部署成功后，自动进入管理菜单。以后运行 `sudo xiaowork-watch` 打开菜单，可配置域名 HTTP 反代、HTTPS、更新、回退、开关自动更新、查看日志及卸载。默认访问 `http://服务器IP:8088`。main 推送后自动构建发布，服务器约每 15 分钟检查更新。卸载保留历史包、证书和共享资源，回退不会降级管理菜单。此安装器仅部署当前前端原型。
+首次显示“部署 / 彻底卸载 / 退出”；选择部署成功后，自动进入管理菜单。以后运行 `sudo xiaowork-watch` 打开菜单，可配置域名 HTTP 反代、HTTPS、更新、回退、开关自动更新、查看日志及卸载。默认访问 `http://服务器IP:8088`。main 推送后自动构建发布，服务器约每 15 分钟检查更新。回退不会降级管理菜单。此安装器仅部署当前前端原型。
+
+菜单 **7. 彻底卸载 xiaowork Watch** 只需输入一次 `UNINSTALL` 确认，移除网站、反代、管理命令和专用任务，并清理本项目的历史包、安装配置及证书。保留 Nginx、Certbot 和其他站点。旧版本或网站已停止时，可用最新安装链接直接卸载：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xiaowork-dev/xiaowork-watch/main/install.sh | sudo bash -s -- --uninstall --purge
+```
+
+此命令仍会提示确认；自选目录须补 `--path`。需要保留历史包和证书时使用 `sudo xiaowork-watch uninstall --confirm`，详见部署说明。
 
 需要 HTTPS 时，先把域名 A 记录指向 VPS 并开放 80/443 端口，再选择菜单 **8. 配置 HTTPS**，输入域名、邮箱并确认。程序申请 Let's Encrypt 证书，配置 HTTP 跳转 HTTPS，并独立自动续期。当前入口使用 IPv4，请移除该域名的 AAAA 记录。切换协议或端口会使用新的浏览器本地存储，因此 HTTPS 首次打开也是空列表；原 HTTP 来源的数据保留。
 

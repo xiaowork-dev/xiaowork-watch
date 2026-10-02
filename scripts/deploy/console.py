@@ -122,11 +122,32 @@ def _default_locked(path):
     if os.name != "posix":
         raise ConsoleError("运维修改需要 Linux 文件锁。")
     import fcntl
-    if Path(path).is_symlink():
+    path = Path(path)
+    parent = path.parent
+    root_stat = parent.lstat()
+    if not stat.S_ISDIR(root_stat.st_mode) or parent.resolve() != parent:
+        raise ConsoleError("安装目录不能是符号链接或含有链接路径。")
+    if path.is_symlink():
         raise ConsoleError("锁文件不能是符号链接。")
-    with open(str(path), "a+b") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    descriptor = os.open(str(path), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(descriptor, "a+b") as handle:
         try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("正在等待正在运行的部署或证书操作完成……", flush=True)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                current_root, current_lock, opened_lock = parent.lstat(), path.lstat(), os.fstat(handle.fileno())
+                valid = (stat.S_ISDIR(current_root.st_mode) and parent.resolve() == parent
+                         and (root_stat.st_dev, root_stat.st_ino) == (current_root.st_dev, current_root.st_ino)
+                         and stat.S_ISREG(current_lock.st_mode)
+                         and (current_lock.st_dev, current_lock.st_ino) == (opened_lock.st_dev, opened_lock.st_ino)
+                         and _read_regular(parent / ".xiaowork-watch-managed").strip() == MARKER_VALUE)
+            except (OSError, ConsoleError):
+                valid = False
+            if not valid:
+                raise ConsoleError("安装目录或部署锁已改变，请重新执行管理命令。")
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -547,15 +568,26 @@ def _check_certbot_defaults():
 
 
 def _unit_state(name, query):
-    try:
-        result = _run(["systemctl", query, name]).strip()
-    except ConsoleError as error:
-        result = str(error).splitlines()[-1].strip()
-        if result not in ("disabled", "inactive", "failed", "not-found"):
-            raise
-    if query == "is-enabled":
-        return result in ("enabled", "enabled-runtime")
-    return result in ("active", "activating")
+    property_name = "UnitFileState" if query == "is-enabled" else "ActiveState"
+    output = _run(["systemctl", "show", name, "--property=LoadState", "--property=" + property_name])
+    properties = {}
+    for line in output.splitlines():
+        match = re.fullmatch(r"(LoadState|" + property_name + r")=(.*)", line)
+        if match:
+            if match[1] in properties:
+                raise ConsoleError("systemd 返回了重复状态属性：" + name)
+            properties[match[1]] = match[2]
+    load = properties.get("LoadState")
+    if load == "not-found":
+        return False
+    state = properties.get(property_name)
+    allowed = ({"enabled", "enabled-runtime", "disabled", "static", "alias", "indirect", "generated",
+                "transient", "linked", "linked-runtime", "masked", "masked-runtime"}
+               if query == "is-enabled" else
+               {"active", "reloading", "activating", "inactive", "failed", "deactivating", "maintenance"})
+    if load not in {"loaded", "masked"} or state not in allowed:
+        raise ConsoleError("无法确认 systemd 服务状态：" + name)
+    return state in ({"enabled", "enabled-runtime"} if query == "is-enabled" else {"active", "reloading"})
 
 
 def _tls_units(manager):
@@ -702,10 +734,138 @@ def _internal_uninstall_targets(manager):
     return targets
 
 
-def uninstall(manager, confirm=False, paths=DEFAULT_PATHS, locked=None):
+def _purge_parent_security(root):
+    if os.name != "posix":
+        return  # Windows is used only for offline fixtures; deployment requires Linux.
+    trusted = {0, os.geteuid()}
+    for directory in (root,) + tuple(root.parents):
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid not in trusted:
+            raise ConsoleError("安装目录或父路径不属于可信管理员，完整清理已停止：" + str(directory))
+        if info.st_mode & 0o022 and not (directory != root and info.st_mode & stat.S_ISVTX and info.st_uid == 0):
+            raise ConsoleError("安装目录或父路径允许其他用户写入，完整清理已停止：" + str(directory))
+
+
+def _purge_root(manager):
+    """Prove the root boundary before opening its lock, without scanning a live update."""
+    root = Path(manager.root)
+    protected = {Path(value) for value in ("/", "/opt", "/etc", "/usr", "/usr/local", "/var", "/var/lib",
+                                          "/var/www", "/home", "/root", "/tmp", "/srv", "/bin", "/sbin")}
+    if (not root.is_absolute() or len(root.parts) < 3 or root in protected or root == Path.home()
+            or root.is_symlink() or not root.is_dir() or root.resolve() != root
+            or root.parent.resolve() != root.parent):
+        raise ConsoleError("拒绝完整清理危险或不明确的安装路径：" + str(root))
+    _purge_parent_security(root)
+    marker = root / ".xiaowork-watch-managed"
+    if _read_regular(marker).strip() != MARKER_VALUE:
+        raise ConsoleError("安装标记无效，未清理数据：" + str(root))
+    return root
+
+
+def _purge_plan(manager):
+    """Read-only proof of a bounded deployment tree while holding its lock."""
+    root = _purge_root(manager)
+    allowed = {".xiaowork-watch-managed", ".installation-complete", ".deploy.lock", "config.json", "installed.json",
+               "releases", "shared", "current", "previous", "control"}
+    for child in root.iterdir():
+        if child.name not in allowed:
+            raise ConsoleError("发现未登记的安装目录内容，完整清理已停止，请先检查该路径：" + str(child))
+        if child.name not in {"releases", "shared", "current", "previous", "control"}:
+            if child.is_symlink() or not stat.S_ISREG(child.lstat().st_mode):
+                raise ConsoleError("安装根目录中的记录不是自有普通文件，已保留：" + str(child))
+    for name in ("releases", "shared"):
+        directory = root / name
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            raise ConsoleError("部署数据目录不安全，已保留：" + str(directory))
+    shared = root / "shared"
+    if shared.exists():
+        for child in shared.iterdir():
+            if child.name not in {"assets", "acme", "letsencrypt", "certbot-work", "certbot-logs"}:
+                raise ConsoleError("共享目录含有未登记内容，已保留：" + str(child))
+            if child.is_symlink() or not child.is_dir():
+                raise ConsoleError("共享数据目录不安全，已保留：" + str(child))
+        _tls_directories(manager)
+    releases = root / "releases"
+    if releases.exists():
+        for release in releases.iterdir():
+            if release.is_symlink() or not release.is_dir() or not re.fullmatch(r"[0-9a-f]{40}", release.name):
+                raise ConsoleError("历史发布目录无法确认归属，已保留：" + str(release))
+            try:
+                metadata = json.loads(_read_regular(release / "release.json"))
+            except (ValueError, OSError) as error:
+                raise ConsoleError("历史发布信息无效，已保留：" + str(release)) from error
+            if (not isinstance(metadata, dict) or type(metadata.get("schema")) is not int or metadata["schema"] != 1
+                    or metadata.get("commit") != release.name or metadata.get("kind") != "frontend-prototype"):
+                raise ConsoleError("历史发布信息不属于此安装，已保留：" + str(release))
+    # st_dev alone misses bind mounts. Linux mountinfo includes those mountpoints.
+    if sys.platform.startswith("linux"):
+        try:
+            mount_lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+        except OSError as error:
+            raise ConsoleError("无法确认安装目录的挂载边界，完整清理已停止。") from error
+        for line in mount_lines:
+            parts = line.split()
+            if len(parts) < 5:
+                raise ConsoleError("无法确认挂载信息，完整清理已停止。")
+            mount = Path(re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), parts[4]))
+            if mount == root or root in mount.parents:
+                raise ConsoleError("安装数据含有挂载目录，已保留：" + str(mount))
+    identity = root.stat()
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        for child in directory.iterdir():
+            info = child.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                try:
+                    child.resolve().relative_to(root)
+                except (ValueError, OSError, RuntimeError) as error:
+                    raise ConsoleError("安装目录含有指向外部或无效的链接，已保留：" + str(child)) from error
+                continue  # Never walk a linked directory.
+            if stat.S_ISDIR(info.st_mode):
+                if info.st_dev != identity.st_dev or os.path.ismount(str(child)):
+                    raise ConsoleError("安装数据含有挂载目录，已保留：" + str(child))
+                pending.append(child)
+            elif not stat.S_ISREG(info.st_mode):
+                raise ConsoleError("安装目录含有特殊文件，已保留：" + str(child))
+    return identity.st_dev, identity.st_ino
+
+
+def _purge_move(manager, identity):
+    root = Path(manager.root)
+    current = root.lstat()
+    if (root.parent.resolve() != root.parent or not stat.S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != identity):
+        raise ConsoleError("安装目录在清理前已改变，请重新执行卸载。")
+    tombstone = root.parent / (".xiaowork-watch-purge-" + secrets.token_hex(16))
+    if (tombstone.parent != root.parent or not tombstone.is_absolute()
+            or tombstone.exists() or tombstone.is_symlink()):
+        raise ConsoleError("无法分配安全的数据清理路径，尚未删除数据。")
+    # Move the inode containing the held lock. Old waiters must reject its stale path.
+    os.rename(str(root), str(tombstone))
+    return tombstone
+
+
+def _purge_remove(tombstone, identity):
+    try:
+        current = tombstone.lstat()
+        if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != identity:
+            raise ConsoleError("清理目录已改变")
+        shutil.rmtree(str(tombstone))
+    except Exception as error:
+        raise ConsoleError("网站入口和服务已卸载，但数据清理未完成。残留数据路径：" + str(tombstone)
+                           + "；请检查后清理，未删除 Nginx、Certbot 或其他站点。") from error
+
+
+def uninstall(manager, confirm=False, paths=DEFAULT_PATHS, locked=None, purge=False):
     if confirm is not True:
         return {"status": "cancelled", "dataRetained": True}
+    if type(purge) is not bool:
+        raise ConsoleError("完整清理选项必须为布尔值。")
+    if purge:
+        _purge_root(manager)  # Reject dangerous roots; inspect transient contents after waiting.
     with _lock(manager, locked):
+        purge_identity = _purge_plan(manager) if purge else None
         global_paths = [(paths.nginx_site, "site"), (paths.nginx_proxy, "proxy"),
                         (paths.wrapper, "wrapper"), (paths.service, "service"), (paths.timer, "timer"),
                         (paths.tls_service, "tls-service"), (paths.tls_timer, "tls-timer")]
@@ -721,6 +881,7 @@ def uninstall(manager, confirm=False, paths=DEFAULT_PATHS, locked=None):
         for path, name in ((paths.timer, "xiaowork-watch-update.timer"), (paths.tls_timer, TLS_TIMER)):
             if path in snapshots:
                 timer_states[name] = (_unit_state(name, "is-enabled"), _unit_state(name, "is-active"))
+        nginx_active = _unit_state("nginx.service", "is-active")
         removed = []
         try:
             config["autoUpdate"] = False
@@ -741,18 +902,23 @@ def uninstall(manager, confirm=False, paths=DEFAULT_PATHS, locked=None):
                     removed.append(path)
             if removed:
                 _run(["nginx", "-t"])
-                _run(["systemctl", "reload", "nginx"])
+                if nginx_active:
+                    _run(["systemctl", "reload", "nginx"])
             for path in (paths.service, paths.timer, paths.tls_service, paths.tls_timer, paths.wrapper):
                 if path in snapshots:
                     path.unlink()
                     removed.append(path)
             if any(path in snapshots for path in (paths.service, paths.timer, paths.tls_service, paths.tls_timer)):
                 _run(["systemctl", "daemon-reload"])
+            tombstone = _purge_move(manager, purge_identity) if purge else None
         except BaseException:
             for path in removed:
                 _write(path, snapshots[path][0], snapshots[path][1])
             _write(config_path, old_config[0], old_config[1])
-            for command in (["systemctl", "daemon-reload"], ["nginx", "-t"], ["systemctl", "reload", "nginx"]):
+            commands = [["systemctl", "daemon-reload"], ["nginx", "-t"]]
+            if nginx_active:
+                commands.append(["systemctl", "reload", "nginx"])
+            for command in commands:
                 try:
                     _run(command)
                 except ConsoleError:
@@ -765,10 +931,13 @@ def uninstall(manager, confirm=False, paths=DEFAULT_PATHS, locked=None):
                     except ConsoleError:
                         pass
             raise
-        internal.sort(key=lambda path: 0 if path.name in ("current", "previous", "control") else 1)
-        for path in internal:
-            path.unlink()
-    return {"status": "uninstalled", "dataRetained": True, "root": str(manager.root)}
+        if purge:
+            _purge_remove(tombstone, purge_identity)
+        else:
+            internal.sort(key=lambda path: 0 if path.name in ("current", "previous", "control") else 1)
+            for path in internal:
+                path.unlink()
+    return {"status": "uninstalled", "dataRetained": not purge, "root": str(manager.root)}
 
 
 def _open_terminal():
@@ -811,6 +980,37 @@ def _status_text(manager):
             + "\nHTTPS：" + ("已配置（独立自动续期）" if config.get("httpsEnabled") else "未配置"))
 
 
+def _uninstall_dialog(manager, terminal, locked, paths=DEFAULT_PATHS):
+    _say(terminal, "\n========== 彻底卸载 xiaowork Watch ==========\n"
+         "将停止网站自动更新和证书续期，移除本项目的 HTTP/HTTPS 站点、管理命令及服务入口。\n"
+         "将永久清理本项目的历史发布包、安装配置和证书，安装目录：" + str(manager.root) + "\n"
+         "Nginx、Certbot 和其他站点保留。")
+    if _ask(terminal, "输入 UNINSTALL 确认卸载（输入 0 或直接回车取消）：") != "UNINSTALL":
+        _say(terminal, "已取消卸载。")
+        return False
+    uninstall(manager, confirm=True, paths=paths, locked=locked, purge=True)
+    _say(terminal, "彻底卸载完成：网站、反代、管理命令及专用定时任务已移除。\n"
+         "本项目历史包、配置和证书已清理，安装目录已移除：" + str(manager.root) + "\n"
+         "重新部署可使用安装链接。")
+    return True
+
+
+def run_uninstall_menu(manager, locked, paths=DEFAULT_PATHS):
+    try:
+        terminal = _open_terminal()
+    except (OSError, ValueError) as error:
+        print("未找到交互终端，未执行卸载。请在 SSH 终端运行 sudo xiaowork-watch uninstall。\n"
+              + str(error), file=sys.stderr)
+        return 1
+    with terminal:
+        try:
+            _uninstall_dialog(manager, terminal, locked, paths)
+            return 0
+        except Exception as error:
+            _say(terminal, "卸载失败：" + str(error))
+            return 1
+
+
 def run_menu(manager, locked, paths=DEFAULT_PATHS):
     try:
         terminal = _open_terminal()
@@ -819,7 +1019,7 @@ def run_menu(manager, locked, paths=DEFAULT_PATHS):
         return 1
     with terminal:
         while True:
-            _say(terminal, "\n========== xiaowork Watch ==========\n服务器管理\n\n  1. 查看状态\n  2. 配置域名 HTTP 反代\n  3. 更新网站\n  4. 回退上一版本\n  5. 自动更新开关\n  6. 查看更新日志\n  7. 卸载网站入口（保留下载数据）\n  8. 配置 HTTPS\n  0. 退出\n")
+            _say(terminal, "\n========== xiaowork Watch ==========\n服务器管理\n\n  1. 查看状态\n  2. 配置域名 HTTP 反代\n  3. 更新网站\n  4. 回退上一版本\n  5. 自动更新开关\n  6. 查看更新日志\n  7. 彻底卸载 xiaowork Watch\n  8. 配置 HTTPS\n  0. 退出\n")
             choice = _ask(terminal, "请选择：")
             if choice in (None, "0"):
                 return 0
@@ -854,12 +1054,8 @@ def run_menu(manager, locked, paths=DEFAULT_PATHS):
                     _require_owned(paths.service, manager, "service", paths)
                     _say(terminal, _run(["journalctl", "-u", "xiaowork-watch-update.service", "--no-pager", "-n", "50"]))
                 elif choice == "7":
-                    first = _ask(terminal, "卸载会停止更新并移除网站/命令入口，保留发布包和共享资源。输入 7 继续：")
-                    if first == "7" and _ask(terminal, "再次确认：请输入 UNINSTALL：") == "UNINSTALL":
-                        uninstall(manager, confirm=True, paths=paths, locked=locked)
-                        _say(terminal, "卸载完成，下载数据与安装配置已保留。可重新执行安装链接。")
+                    if _uninstall_dialog(manager, terminal, locked, paths):
                         return 0
-                    _say(terminal, "已取消卸载。")
                 elif choice == "8":
                     default = manager._config().get("proxyDomain", "")
                     entered = _ask(terminal, "HTTPS 域名" + (" [" + default + "]" if default else "") + "（Enter 接受默认）：")

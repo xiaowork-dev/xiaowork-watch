@@ -8,13 +8,15 @@ server_name=_
 action=menu
 non_interactive=false
 confirm_uninstall=false
+purge_data=false
 show_after_install=false
 usage() {
  cat <<'HELP'
 用法：sudo bash install.sh [--port 8088] [--domain watch.example.com] [--path /opt/xiaowork-watch]
 默认打开中文菜单：首次部署/卸载，安装后打开管理菜单。
 --install / --non-interactive 直接部署或更新，不打开菜单。
---uninstall  卸载服务入口并保留下载数据；无终端时还需 --confirm。
+--uninstall  卸载服务入口；加 --purge 清理本项目历史包、配置和证书。
+--confirm    无交互终端时显式确认卸载；菜单卸载默认包含本项目数据。
 --menu       打开菜单（默认）；--help 显示说明。
 仅支持 Ubuntu/Debian，目前部署前端原型，自动更新约每15分钟检查一次。
 手动源码部署仍可用，详见 docs/deployment/server.md。
@@ -32,11 +34,13 @@ while (($#)); do
   --menu) action=menu; shift;;
   --non-interactive) non_interactive=true; shift;;
   --confirm) confirm_uninstall=true; shift;;
+  --purge) purge_data=true; shift;;
   *) usage; exit 2;;
  esac
 done
 [[ "$non_interactive" != true || "$action" != menu ]] || action=deploy
 [[ "$confirm_uninstall" != true || "$action" == uninstall ]] || { usage; exit 2; }
+[[ "$purge_data" != true || "$action" == uninstall ]] || { usage; exit 2; }
 [[ "$listen_port" =~ ^[0-9]{1,5}$ ]] && ((10#$listen_port >= 1 && 10#$listen_port <= 65535)) || { echo 'Invalid port.' >&2; exit 2; }
 [[ "$server_name" == _ || "$server_name" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || { echo 'Invalid domain.' >&2; exit 2; }
 [[ "$deploy_root" =~ ^/[A-Za-z0-9._/-]+$ && "$deploy_root" != / && "$deploy_root" != */../* && "$deploy_root" != */.. && "$deploy_root" != */./* ]] || { echo 'Invalid installation path.' >&2; exit 2; }
@@ -75,11 +79,11 @@ open_menu_terminal() {
 show_initial_menu() {
  open_menu_terminal || return $?
  while true; do
-  printf '\n========== xiaowork Watch ==========\n当前未部署\n\n  1. 部署\n  2. 卸载\n  0. 退出\n\n请选择 [0-2]：' >&3
+  printf '\n========== xiaowork Watch ==========\n当前未部署\n\n  1. 部署\n  2. 彻底卸载 xiaowork Watch\n  0. 退出\n\n请选择 [0-2]：' >&3
   if ! IFS= read -r -u 3 selection; then action=exit; return 0; fi
   case "$selection" in
    1) action=deploy; show_after_install=true; return 0;;
-   2) action=uninstall; return 0;;
+   2) action=uninstall; purge_data=true; return 0;;
    0|'') action=exit; return 0;;
    *) printf '请输入 0、1 或 2。\n' >&3;;
   esac
@@ -110,7 +114,9 @@ for name in ('manage.py', 'console.py'):
 PY
 }
 run_management() (
- if [[ -e "$deploy_root/control" || -L "$deploy_root/control" ]]; then
+ # Uninstall uses the latest published tools so older installations can use
+ # cleanup fixes even when a website update cannot pass its health check.
+ if [[ "${1:-}" != uninstall && ( -e "$deploy_root/control" || -L "$deploy_root/control" ) ]]; then
   [[ -L "$deploy_root/control" ]] || { echo '管理入口不是受控的版本链接，已停止。' >&2; exit 1; }
   control_target=$(realpath -e -- "$deploy_root/control")
   control_relative=${control_target#"$deploy_root/releases/"}
@@ -120,7 +126,7 @@ run_management() (
   done
   exec python3 "$control_target/manage.py" --root "$deploy_root" "$@"
  fi
- if [[ -f "$deploy_root/current/.deploy/manage.py" && -f "$deploy_root/current/.deploy/console.py" ]]; then
+ if [[ "${1:-}" != uninstall && -f "$deploy_root/current/.deploy/manage.py" && -f "$deploy_root/current/.deploy/console.py" ]]; then
   exec python3 "$deploy_root/current/.deploy/manage.py" --root "$deploy_root" "$@"
  fi
  # Older releases do not understand menu/uninstall. Load tools from a pinned
@@ -130,7 +136,7 @@ run_management() (
   case "$management_temp" in /tmp/xiaowork-watch-menu.*) [[ -d "$management_temp" && ! -L "$management_temp" ]] && rm -rf -- "$management_temp";; esac
  }
  trap cleanup_management EXIT
- printf '正在获取新版管理菜单，当前网站版本保持不变。\n'
+ printf '正在获取最新已发布的管理工具……\n'
  load_latest_scripts "$management_temp"
  python3 "$management_temp/manage.py" --root "$deploy_root" "$@"
 )
@@ -146,12 +152,25 @@ if [[ "$action" == uninstall ]]; then
  if [[ ! -f "$marker" ]]; then printf '此目录没有本项目的部署记录，无需卸载。\n'; exit 0; fi
  if [[ "$confirm_uninstall" != true ]]; then
   open_menu_terminal
-  printf '\n将移除本项目的站点配置、反代和自动更新入口。\n历史发布包保留在 %s；Nginx 和其他站点保留。\n输入 UNINSTALL 确认，其他输入取消：' "$deploy_root" >&3
+  printf '\n将移除本项目的网站、反代、管理命令及更新和证书续期任务。\n' >&3
+  if [[ "$purge_data" == true ]]; then
+   printf '本项目历史包、配置和证书将从 %s 完全清理。\n' "$deploy_root" >&3
+  else
+   printf '本项目历史包、配置和证书保留在 %s。\n' "$deploy_root" >&3
+  fi
+  printf 'Nginx、Certbot 和其他站点保留。\n输入 UNINSTALL 确认，其他输入取消：' >&3
   IFS= read -r -u 3 confirmation || exit 0
   [[ "$confirmation" == UNINSTALL ]] || { printf '已取消卸载。\n' >&3; exit 0; }
  fi
- run_management uninstall --confirm
- exit $?
+ if [[ "$purge_data" == true ]]; then
+  run_management uninstall --confirm --purge
+  printf '彻底卸载完成：本项目的网站、反代、管理命令及专用任务已移除。\n历史包、配置和证书已清理，安装目录已移除：%s\n' "$deploy_root"
+ else
+  run_management uninstall --confirm
+  printf '卸载完成：本项目的服务入口已移除，历史包、配置和证书保留在 %s。\n' "$deploy_root"
+ fi
+ printf 'Nginx、Certbot 和其他站点保留。\n'
+ exit 0
 fi
 if [[ "$installed" == true ]]; then
  if [[ "$action" == menu ]]; then run_management menu; else python3 "$deploy_root/current/.deploy/manage.py" --root "$deploy_root" update; fi

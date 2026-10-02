@@ -69,6 +69,9 @@ class ConsoleTests(unittest.TestCase):
         self.root.mkdir()
         self.system.mkdir()
         self.manager = FakeManager(self.root)
+        state_query = patch.object(console, "_unit_state", return_value=False)
+        state_query.start()
+        self.addCleanup(state_query.stop)
         self.paths = console.Paths(**{name: self.system / name for name in (
             "nginx_site", "nginx_proxy", "wrapper", "service", "timer", "tls_service", "tls_timer")})
         self.locked_paths = []
@@ -286,14 +289,50 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn('自动更新：开启', terminal.output.getvalue())
         self.assertEqual(self.locked_paths, [])
 
-    def test_menu_uninstall_requires_both_confirmations_and_exits_after_removal(self):
-        terminal = Terminal("7\n7\nNO\n7\n7\nUNINSTALL\n")
+    def test_menu_uninstall_requires_confirmation_and_exits_after_removal(self):
+        # The old generic keep.data fixtures are not owned deployment artifacts.
+        (self.root / "releases/keep.data").unlink()
+        (self.root / "shared/keep.data").unlink()
+        terminal = Terminal("7\nNO\n7\nUNINSTALL\n")
         with patch.object(console, "_open_terminal", return_value=terminal), patch.object(console, "_run", return_value=""):
             self.assertEqual(console.run_menu(self.manager, self.locked, paths=self.paths), 0)
         self.assertIn("已取消卸载", terminal.output.getvalue())
         self.assertIn("卸载完成", terminal.output.getvalue())
+        self.assertIn("卸载 xiaowork Watch", terminal.output.getvalue())
+        self.assertIn("历史发布包、安装配置和证书", terminal.output.getvalue())
         self.assertEqual(len(self.locked_paths), 1)
         self.assertFalse(self.paths.wrapper.exists())
+        self.assertFalse(self.root.exists())
+
+    def test_uninstall_dialog_cancel_and_eof_do_not_change_state_or_lock(self):
+        for answers in ("7\n0\n1\n0\n", "7\n", "7\n\n0\n", "7\nuninstall\n0\n"):
+            with self.subTest(answers=answers):
+                terminal = Terminal(answers)
+                with patch.object(console, "_open_terminal", return_value=terminal), patch.object(console, "uninstall") as removal:
+                    self.assertEqual(console.run_menu(self.manager, self.locked, paths=self.paths), 0)
+                removal.assert_not_called()
+                self.assertEqual(self.locked_paths, [])
+                self.assertTrue(self.paths.wrapper.exists())
+
+    def test_uninstall_error_remains_in_main_menu_and_does_not_report_success(self):
+        terminal = Terminal("7\nUNINSTALL\n1\n0\n")
+        with patch.object(console, "_open_terminal", return_value=terminal), patch.object(console, "uninstall", side_effect=console.ConsoleError("fixture uninstall failed")):
+            self.assertEqual(console.run_menu(self.manager, self.locked, paths=self.paths), 0)
+        output = terminal.output.getvalue()
+        self.assertIn("fixture uninstall failed", output)
+        self.assertIn("当前版本", output)
+        self.assertNotIn("卸载完成", output)
+
+    def test_standalone_uninstall_menu_confirm_cancel_and_no_tty(self):
+        for answer, expected in (("UNINSTALL\n", 1), ("0\n", 0), ("", 0)):
+            with self.subTest(answer=answer):
+                terminal = Terminal(answer)
+                with patch.object(console, "_open_terminal", return_value=terminal), patch.object(console, "uninstall") as removal:
+                    self.assertEqual(console.run_uninstall_menu(self.manager, self.locked, paths=self.paths), 0)
+                self.assertEqual(removal.call_count, expected)
+        with patch.object(console, "_open_terminal", side_effect=OSError("no tty")), patch.object(console, "uninstall") as removal, patch("sys.stderr", new=io.StringIO()):
+            self.assertEqual(console.run_uninstall_menu(self.manager, self.locked, paths=self.paths), 1)
+        removal.assert_not_called()
 
     @unittest.skipUnless(os.name == "posix", "Real symbolic-link ownership requires Linux")
     def test_uninstall_rejects_symlink_record_before_system_changes(self):

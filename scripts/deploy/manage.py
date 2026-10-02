@@ -274,13 +274,39 @@ def _validate_release(directory, sha):
 
 @contextlib.contextmanager
 def _locked(path):
-    if path.is_symlink():
+    path = Path(path).absolute()
+    if path.is_symlink() or not stat.S_ISDIR(path.parent.lstat().st_mode):
         raise DeploymentError("Unsafe lock file")
-    with path.open("a+b") as handle:
+    root_identity = path.parent.lstat()
+    root_canonical = path.parent.resolve()
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(str(path), flags, 0o600)
+    with os.fdopen(descriptor, "a+b") as handle:
+        def validate_generation():
+            try:
+                current_root, current_lock = path.parent.lstat(), path.lstat()
+                held_lock = os.fstat(handle.fileno())
+                same_root = (current_root.st_dev, current_root.st_ino) == (root_identity.st_dev, root_identity.st_ino)
+                same_lock = (current_lock.st_dev, current_lock.st_ino) == (held_lock.st_dev, held_lock.st_ino)
+                if (not stat.S_ISDIR(current_root.st_mode) or path.parent.resolve() != root_canonical
+                        or not stat.S_ISREG(current_lock.st_mode)
+                        or not same_root or not same_lock):
+                    raise DeploymentError("安装目录或锁已改变，已停止等待中的操作。")
+                if path.name == ".deploy.lock":
+                    marker = path.parent / MARKER
+                    if not _regular(marker) or marker.read_text(encoding="ascii").strip() != MARKER_VALUE:
+                        raise DeploymentError("安装已卸载或标记已改变，已停止等待中的操作。")
+            except OSError as error:
+                raise DeploymentError("安装已卸载或被替换，已停止等待中的操作。") from error
         if os.name == "posix":
             import fcntl
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print("正在等待正在进行的更新、续期或卸载完成，请稍候……", flush=True)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                validate_generation()
                 yield
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -293,6 +319,7 @@ def _locked(path):
             handle.seek(0)
             msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
             try:
+                validate_generation()
                 yield
             finally:
                 handle.seek(0)
@@ -537,8 +564,9 @@ def main(argv=None):
     secure.add_argument("--email", required=True, help="Contact email for the certificate account")
     secure.add_argument("--agree-tos", action="store_true", help="Explicitly agree to Let's Encrypt terms")
     commands.add_parser("renew-https", help="Renew this deployment's certificate and reload Nginx")
-    removal = commands.add_parser("uninstall", help="Remove this deployment's service entries; keep downloaded data")
+    removal = commands.add_parser("uninstall", help="Open full uninstall confirmation; use --confirm for unattended removal")
     removal.add_argument("--confirm", action="store_true", help="Explicitly confirm removal without an interactive menu")
+    removal.add_argument("--purge", action="store_true", help="Also delete this deployment's packages, configuration and certificates")
     args = parser.parse_args(argv)
     try:
         manager = Manager(args.root)
@@ -567,7 +595,9 @@ def main(argv=None):
             elif args.command == "renew-https":
                 result = console.renew_https(manager, locked=_locked)
             else:
-                result = console.uninstall(manager, confirm=args.confirm, locked=_locked)
+                if not args.confirm:
+                    return console.run_uninstall_menu(manager, _locked)
+                result = console.uninstall(manager, confirm=True, locked=_locked, purge=args.purge)
             print(json.dumps(result, sort_keys=True, ensure_ascii=False))
             return 0
         with _locked(manager.root / ".deploy.lock"):
