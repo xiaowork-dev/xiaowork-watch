@@ -1,4 +1,4 @@
-name: Build and publish frontend
+name: Build and publish monitoring platform
 
 on:
   push:
@@ -53,14 +53,17 @@ jobs:
       - name: Install local Nginx and Certbot test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends nginx openssl certbot
+          sudo apt-get install -y --no-install-recommends nginx openssl certbot iputils-ping
       - name: Test installer and updater
         run: |
           bash -n install.sh
           /usr/bin/python3 -c "from certbot._internal import constants"
-          /usr/bin/python3 -m unittest discover -s tests -p 'test_deploy*.py' -v
-      - name: Build frontend prototype
-        run: npm run build
+          /usr/bin/python3 -m unittest discover -s tests -p 'test_*.py' -v
+          bash -n agent/install.sh
+      - name: Build monitoring frontend
+        run: |
+          node tests/test_frontend.mjs
+          npm run build
       - name: Package verified build
         env:
           SOURCE_SHA: ${{ github.sha }}

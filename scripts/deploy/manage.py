@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install the static frontend prototype; this does not deploy an API or agent.
+"""Install and update xiaowork Watch, preserving private monitoring data.
 
 Python 3.8+, standard library only. The installer owns Nginx/systemd setup.
 """
@@ -264,12 +264,27 @@ def _validate_release(directory, sha):
         raise DeploymentError("Unsafe release manager directory")
     metadata = _json_file(directory / "release.json")
     if (type(metadata.get("schema")) is not int or metadata["schema"] != 1
-            or metadata.get("commit") != sha or metadata.get("kind") != "frontend-prototype"
+            or metadata.get("commit") != sha or metadata.get("kind") not in ("frontend-prototype", "monitoring-server")
             or not isinstance(metadata.get("version"), str) or not metadata["version"]):
         raise DeploymentError("Release metadata does not match its tag")
     if (directory / "assets").is_symlink() or not (directory / "assets").is_dir():
         raise DeploymentError("Release is missing its assets directory")
+    if metadata["kind"] == "monitoring-server":
+        for name in (".deploy/console.py", ".deploy/runtime.py", ".backend/server.py", ".agent/agent.py", ".agent/install.sh"):
+            if not _regular(directory / name) or not (directory / name).stat().st_size:
+                raise DeploymentError("Live release is missing " + name)
     return metadata
+
+
+def _runtime():
+    import importlib.util
+    path = Path(__file__).resolve().with_name("runtime.py")
+    if not _regular(path):
+        raise DeploymentError("主控部署工具缺失，请重新运行最新安装链接。")
+    specification = importlib.util.spec_from_file_location("xiaowork_watch_runtime", str(path))
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
 
 
 @contextlib.contextmanager
@@ -473,7 +488,7 @@ class Manager:
                     raise DeploymentError("Health response is too large")
                 value = json.loads(raw)
                 if (type(value.get("schema")) is int and value["schema"] == 1
-                        and value.get("commit") == sha and value.get("kind") == "frontend-prototype"):
+                        and value.get("commit") == sha and value.get("kind") in ("frontend-prototype", "monitoring-server")):
                     return
                 last_error = "Nginx served a different release"
             except Exception as error:
@@ -484,20 +499,31 @@ class Manager:
 
     def _record(self, current, previous):
         _atomic_json(self.root / "installed.json", {
-            "current": current, "previous": previous, "kind": "frontend-prototype",
+            "current": current, "previous": previous, "kind": _validate_release(self.releases / current, current)["kind"],
             "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
 
     def _activate(self, sha, config, resume=False):
         old, previous = self._pointed_sha("current"), self._pointed_sha("previous")
         old_config = dict(config)
         config_written = False
+        runtime = None
         try:
+            metadata = _validate_release(self.releases / sha, sha)
+            if metadata["kind"] == "monitoring-server":
+                config["backendEnabled"] = True
+                runtime_module = _runtime()
+                config['backendPort'] = runtime_module.api_port(config)
+                runtime = runtime_module.Activation(self, self.releases / sha, config)
+                runtime.prepare()
             self._switch("current", sha)
+            if runtime is not None:
+                runtime.start()
             self._health(sha, config)
             if old and old != sha:
                 self._switch("previous", old)
-            if resume:
-                config["autoUpdate"] = True
+            if resume or runtime is not None:
+                if resume:
+                    config["autoUpdate"] = True
                 _atomic_json(self.root / "config.json", config)
                 config_written = True
             self._record(sha, old if old and old != sha else previous)
@@ -506,6 +532,8 @@ class Manager:
             self._switch("previous", previous)
             if config_written:
                 _atomic_json(self.root / "config.json", old_config)
+            if runtime is not None:
+                runtime.restore()
             raise
 
     def install_or_update(self, automatic=False, tag=None):
@@ -523,9 +551,16 @@ class Manager:
         current, previous = self._pointed_sha("current"), self._pointed_sha("previous")
         if not current or not previous or current == previous:
             raise DeploymentError("No previous release is available")
+        current_kind = _validate_release(self.releases / current, current)["kind"]
+        previous_kind = _validate_release(self.releases / previous, previous)["kind"]
+        if current_kind == "monitoring-server" and previous_kind != "monitoring-server":
+            raise DeploymentError("上一版是模拟原型，不能作为真实监控的回退版本；数据已保留。")
         config["autoUpdate"] = False
         _atomic_json(self.root / "config.json", config)
         self._assets(self.releases / previous)
+        if previous_kind == "monitoring-server":
+            self._activate(previous, config)
+            return {"status": "rolled-back", "current": previous, "autoUpdate": False}
         try:
             self._switch("current", previous)
             self._health(previous, config)
@@ -541,7 +576,12 @@ class Manager:
         config = self._config()
         return {"status": "installed" if self._pointed_sha("current") else "not-installed",
                 "current": self._pointed_sha("current"), "previous": self._pointed_sha("previous"),
-                "autoUpdate": config.get("autoUpdate", True), "kind": "frontend-prototype"}
+                "autoUpdate": config.get("autoUpdate", True),
+                "kind": (_validate_release(self.releases / self._pointed_sha("current"), self._pointed_sha("current"))["kind"]
+                         if self._pointed_sha("current") else None)}
+
+    def reset_admin(self, capture=False):
+        return _runtime().reset_admin(self, capture=capture)
 
 
 def main(argv=None):
@@ -554,6 +594,7 @@ def main(argv=None):
     updater.add_argument("--automatic", action="store_true", help="Respect rollback's update pause")
     commands.add_parser("rollback")
     commands.add_parser("status")
+    commands.add_parser("reset-admin", help="Reset administrator password and revoke active sessions")
     commands.add_parser("menu", help="Open the Chinese server management menu")
     proxy = commands.add_parser("proxy", help="Configure an HTTP domain reverse proxy")
     proxy.add_argument("domain")
@@ -579,6 +620,10 @@ def main(argv=None):
             sys.modules[specification.name] = console
             specification.loader.exec_module(console)
             console.ensure_control_entry(manager, locked=_locked)
+        if args.command == "reset-admin":
+            with _locked(manager.root / ".deploy.lock"):
+                manager.reset_admin()
+            return 0
         if args.command in (None, "menu", "proxy", "auto-update", "https", "renew-https", "uninstall"):
             if console is None:
                 raise DeploymentError("Menu tools are unavailable. Update or run the latest install.sh to open the menu.")

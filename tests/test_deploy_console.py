@@ -126,6 +126,24 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(commands.call_args_list[0].args[0], ["nginx", "-t"])
         self.assertEqual(self.locked_paths, [self.root / ".deploy.lock"])
 
+    def test_live_proxy_adds_inner_domain_and_preserves_browser_host(self):
+        self.write_config(backendEnabled=True)
+        site = self.paths.nginx_site.read_text(encoding='utf-8').replace('server {', 'server {\n server_name inner.example.com;')
+        self.paths.nginx_site.write_text(site, encoding='utf-8')
+        with patch.object(console, '_run', return_value=''):
+            self.proxy()
+        self.assertIn('server_name inner.example.com watch.example.com;', self.paths.nginx_site.read_text(encoding='utf-8'))
+        self.assertIn('proxy_set_header Host $http_host;', self.paths.nginx_proxy.read_text(encoding='utf-8'))
+
+    def test_live_proxy_failure_restores_inner_aliases(self):
+        self.write_config(backendEnabled=True)
+        site = self.paths.nginx_site.read_text(encoding='utf-8').replace('server {', 'server {\n server_name inner.example.com;')
+        self.paths.nginx_site.write_text(site, encoding='utf-8')
+        with patch.object(console, '_run', side_effect=console.ConsoleError('fixture nginx error')), self.assertRaises(console.ConsoleError):
+            self.proxy()
+        self.assertEqual(self.paths.nginx_site.read_text(encoding='utf-8'), site)
+        self.assertFalse(self.paths.nginx_proxy.exists())
+
     def test_domain_injection_never_writes_or_runs_nginx(self):
         for domain in ("x; include /tmp/evil", "x\nserver {}", "https://example.com", "a:80", "a/b", "_", "a..com", "a" * 64 + ".com"):
             with self.subTest(domain=domain), patch.object(console, "_run") as commands:

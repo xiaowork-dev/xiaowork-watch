@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Installs the frontend prototype only. No monitor backend or VPS agent yet.
+# Installs the real monitor backend and public/admin frontend.
 deploy_root=/opt/xiaowork-watch
 listen_port=8088
 server_name=_
@@ -18,7 +18,7 @@ usage() {
 --uninstall  卸载服务入口；加 --purge 清理本项目历史包、配置和证书。
 --confirm    无交互终端时显式确认卸载；菜单卸载默认包含本项目数据。
 --menu       打开菜单（默认）；--help 显示说明。
-仅支持 Ubuntu/Debian，目前部署前端原型，自动更新约每15分钟检查一次。
+仅支持 Ubuntu/Debian，部署真实主控和公开查看页，自动更新约每15分钟检查一次。
 手动源码部署仍可用，详见 docs/deployment/server.md。
 HELP
 }
@@ -109,7 +109,7 @@ if not {'xiaowork-watch-web.tar.gz', 'xiaowork-watch-web.tar.gz.sha256'} <= name
     raise SystemExit('发布包未上传完成，请稍后重试。')
 folder = pathlib.Path(sys.argv[1])
 folder.joinpath('tag').write_text(tag, encoding='utf-8')
-for name in ('manage.py', 'console.py'):
+for name in ('manage.py', 'console.py', 'runtime.py'):
     folder.joinpath(name).write_bytes(fetch('https://raw.githubusercontent.com/' + repo + '/' + tag[4:] + '/scripts/deploy/' + name))
 PY
 }
@@ -137,6 +137,15 @@ run_management() (
  }
  trap cleanup_management EXIT
  printf '正在获取最新已发布的管理工具……\n'
+ load_latest_scripts "$management_temp"
+ python3 "$management_temp/manage.py" --root "$deploy_root" "$@"
+)
+run_latest_management() (
+ management_temp=$(mktemp -d /tmp/xiaowork-watch-menu.XXXXXXXX)
+ cleanup_management() {
+  case "$management_temp" in /tmp/xiaowork-watch-menu.*) [[ -d "$management_temp" && ! -L "$management_temp" ]] && rm -rf -- "$management_temp";; esac
+ }
+ trap cleanup_management EXIT
  load_latest_scripts "$management_temp"
  python3 "$management_temp/manage.py" --root "$deploy_root" "$@"
 )
@@ -173,7 +182,17 @@ if [[ "$action" == uninstall ]]; then
  exit 0
 fi
 if [[ "$installed" == true ]]; then
- if [[ "$action" == menu ]]; then run_management menu; else python3 "$deploy_root/current/.deploy/manage.py" --root "$deploy_root" update; fi
+ current_kind=$(python3 - "$deploy_root/current/release.json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding='utf-8')).get('kind', ''))
+PY
+ )
+ if [[ "$current_kind" != monitoring-server ]]; then
+  printf '正在从前端原型升级到真实监控，已有 HTTPS 配置将保留……\n'
+  run_latest_management update
+  printf '升级完成。公开页为 /，管理员后台为 /admin；初始密码见上方输出。\n'
+ fi
+ if [[ "$action" == menu ]]; then run_management menu; else run_latest_management update; fi
  exit $?
 fi
 for reserved in "$nginx_config" "$wrapper" "$service" "$timer"; do
@@ -305,7 +324,8 @@ systemctl enable nginx
 systemctl enable --now xiaowork-watch-update.timer
 printf '%s\n' xiaowork-watch-managed-v1 > "$completion"
 install_success=true
-printf '\n部署完成，端口 %s。当前为前端原型，真实监控后端与 VPS 探针尚未接入。\n' "$listen_port"
+printf '\n真实监控部署完成，端口 %s。公开页为 /，管理员后台为 /admin。\n' "$listen_port"
+printf '管理员用户名 admin，初始随机密码见上方输出；忘记密码运行 sudo xiaowork-watch reset-admin。\n'
 printf '访问 http://服务器IP:%s/ ，如有防火墙或云安全组请开放此端口。\n' "$listen_port"
 printf '管理菜单：sudo xiaowork-watch\n命令：sudo xiaowork-watch update | rollback | status\n'
 printf '约每15分钟检查 GitHub 更新；手动回退会暂停自动更新。\n'

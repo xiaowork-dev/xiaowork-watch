@@ -52,6 +52,23 @@ class PackageTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             MODULE.package(self.root, self.root / 'out', self.sha)
 
+    def test_live_package_includes_runtime_backend_and_agent_but_no_database(self):
+        (self.root / 'backend').mkdir()
+        (self.root / 'agent').mkdir()
+        (self.root / 'backend/server.py').write_text('# controller\n')
+        (self.root / 'backend/watch.sqlite3').write_bytes(b'private database')
+        (self.root / 'scripts/deploy/runtime.py').write_text('# runtime\n')
+        (self.root / 'agent/agent.py').write_text('# agent\n')
+        (self.root / 'agent/install.sh').write_text('#!/bin/bash\n')
+        MODULE.package(self.root, self.root / 'live', self.sha)
+        with tarfile.open(self.root / 'live/xiaowork-watch-web.tar.gz') as archive:
+            metadata = json.load(archive.extractfile('release.json'))
+            self.assertEqual(metadata['kind'], 'monitoring-server')
+            self.assertIn('.backend/server.py', archive.getnames())
+            self.assertIn('.deploy/runtime.py', archive.getnames())
+            self.assertIn('.agent/agent.py', archive.getnames())
+            self.assertNotIn('.backend/watch.sqlite3', archive.getnames())
+
     def test_invalid_commit_and_missing_index_rejected(self):
         with self.assertRaises(ValueError):
             MODULE.package(self.root, self.root / 'out', 'main')

@@ -1,67 +1,64 @@
 # xiaowork Watch
 
-面向个人开发者的 网站与 VPS 监控平台。本次交付为 v0.2.6 **可交互的前端原型**，采用 Vue 3 + Vite + Axios；实际后端仍按开发文档规划使用 Java 21 + Spring Boot + MySQL 8 + MyBatis-Plus。
+个人网站与 VPS 监控平台，v0.3.0 开始使用真实检测。Vue 3 前端、Python 3 主控、SQLite 数据库；Ubuntu/Debian 一键部署无需 Node.js、Java 或独立数据库。
 
-## 原型范围
+## 使用方式
 
-网站监控列表、创建/编辑表单、启用/停用、删除确认、演示检测、详情与分页历史。新增 VPS 管理、自定义测试节点、节点到 VPS 的延迟与丢包视图，以及 Ubuntu/Debian 安装引导。未实现后端检测器、后台调度、数据库、身份验证或真实 Linux 探针。
+- `/`：公开查看网站、VPS、节点状态及检测历史，无需登录。
+- `/admin`：管理员登录后新增、编辑、删除、启停监控，立即检测，生成探针安装命令。
+- 网站：服务器按设定间隔发送真实 HTTP GET/HEAD 请求，记录状态码、响应时间、成功/失败与错误；浏览器关闭后继续检测。
+- VPS：安装探针后每 30 秒向主控上报心跳。自建测试节点对已关联 VPS 发出 5 个 ICMP Ping，保存真实延迟和丢包；节点离线不会生成虚假的失败测量。
 
-首次访问时，网站监控、VPS、测试节点和检测历史均为空，由自己添加。更新保留当前浏览器中已有的配置、历史和旧样例。原型不会请求目标地址或发送 Ping；添加后产生的检测结果仍为演示情境，本地修改仅保存在当前浏览器，不代表线上服务状态。停用是独立的 enabled 配置，不改变最近一次 UP/DOWN/UNKNOWN 检测结果。
+监控、账号、历史保存在服务器数据库中，更新与 HTTP/HTTPS 切换不会重置。初始列表为空。旧原型 localStorage 数据不自动导入真实数据库，不再生成演示结果。
 
-## VPS 与测试节点
+## 一键部署 / 从旧版升级
 
-真实版本的设计为：网站是主控，VPS 探针上报心跳，测试节点向选定的 VPS 测量 ICMP 延迟与丢包。当前界面演示分别显示探针在线状态和线路测量结果，不把节点离线当成 VPS 故障。
-
-安装区目前只有全部注释的命令模板；复制模板不会安装服务或注册探针。独立的“演示注册上线”按钮只更新本地示例数据。真实安装需要部署主控后端与 Linux 探针。详细实施约定见 [VPS 与节点设计](docs/design/vps-v0.2.md)。
-
-## 本地启动
-
-使用 Node.js 20.19+（20.x）或 22.12+。本机 Node.js 20.20.2 已验证构建通过：
-
-```powershell
-npm install
-npm run dev
-```
-
-访问终端输出的本地地址。生产构建使用 `npm run build`。
-
-## 服务器部署
-
-保留自己拉取 Git 源码、构建并使用 Nginx 托管的方式。也可在 Ubuntu/Debian 的 SSH 终端用一条命令打开部署菜单：
+在自己的 Ubuntu/Debian SSH 终端运行：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/xiaowork-dev/xiaowork-watch/main/install.sh | sudo bash
 ```
 
-首次显示“部署 / 彻底卸载 / 退出”；选择部署成功后，自动进入管理菜单。以后运行 `sudo xiaowork-watch` 打开菜单，可配置域名 HTTP 反代、HTTPS、更新、回退、开关自动更新、查看日志及卸载。默认访问 `http://服务器IP:8088`。main 推送后自动构建发布，服务器约每 15 分钟检查更新。回退不会降级管理菜单。此安装器仅部署当前前端原型。
-
-菜单 **7. 彻底卸载 xiaowork Watch** 只需输入一次 `UNINSTALL` 确认，移除网站、反代、管理命令和专用任务，并清理本项目的历史包、安装配置及证书。保留 Nginx、Certbot 和其他站点。旧版本或网站已停止时，可用最新安装链接直接卸载：
+未部署时选择 1；原型版重新运行此链接会升级主控并保留已有域名与 HTTPS 配置。首次随机生成管理员密码，仅在安装终端输出；用户名 `admin`。遗忘密码可在服务器执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xiaowork-dev/xiaowork-watch/main/install.sh | sudo bash -s -- --uninstall --purge
+sudo xiaowork-watch reset-admin
 ```
 
-此命令仍会提示确认；自选目录须补 `--path`。需要保留历史包和证书时使用 `sudo xiaowork-watch uninstall --confirm`，详见部署说明。
+也可用管理菜单 **9. 重置管理员密码**，重置后原登录会话失效。没有公开注册或共享默认密码。
 
-需要 HTTPS 时，先把域名 A 记录指向 VPS 并开放 80/443 端口，再选择菜单 **8. 配置 HTTPS**，输入域名、邮箱并确认。程序申请 Let's Encrypt 证书，配置 HTTP 跳转 HTTPS，并独立自动续期。当前入口使用 IPv4，请移除该域名的 AAAA 记录。切换协议或端口会使用新的浏览器本地存储，因此 HTTPS 首次打开也是空列表；原 HTTP 来源的数据保留。
+安装后 `sudo xiaowork-watch` 打开管理菜单，保留反代、HTTPS、更新、回退、自动更新、日志和彻底卸载。默认网站端口 8088，主控仅在 `127.0.0.1:8091` 监听。main 推送后发布完整前后端包，服务器约每 15 分钟检查更新。详细步骤和手动源码部署见 [服务器部署说明](docs/deployment/server.md)。
 
-旧 v0.2.1 服务器可先运行 `sudo xiaowork-watch update`，再运行 `sudo xiaowork-watch`。无交互终端时显式加 `--non-interactive` 部署。自选端口、域名、手动源码部署和管理命令见 [服务器部署说明](docs/deployment/server.md)。
+## VPS / 测试节点
 
-## 文件结构
+1. 管理员进入后台添加 VPS 和测试节点。
+2. 在每项的“安装探针”中生成命令，在该项对应 Linux 服务器的 SSH 终端粘贴运行。
+3. 节点和 VPS 安装成功后上报心跳；编辑 VPS 勾选测试节点，保存后每分钟测量，也可立即提交测量。
 
-```text
-src/App.vue              页面与交互
-src/style.css            浅色界面、响应式布局
-src/components/          表单和状态徽标
-src/api/monitors.js       Axios API 适配器
-src/api/demo.js           网站本地示例适配器
-src/api/fleet.js          VPS/测试节点数据适配器
-docs/design/             设计范围与交接约定
-docs/requirements/       原始开发文档
+公网探针连接主控使用 HTTPS，安装码 10 分钟有效且只用一次。长期凭据保存在对应服务器的受限配置文件；删除目标或重新注册会撤销其旧凭据。探针只主动连接主控，无需在 VPS 上开放管理端口。Ping 无回复可能来自 ICMP 限制，页面把线路结果与探针心跳分开显示。
+
+探针卸载：下载主控提供的 `/agent/install.sh` 后运行 `sudo bash install.sh --uninstall`，仅清理该探针；主控记录可在后台删除。
+
+## 本地开发
+
+Node.js 20.19+ 或 22.12+，Python 3.9+：
+
+```powershell
+npm ci
+python backend/server.py --data-dir .local-data --init-admin
+python backend/server.py --data-dir .local-data --host 127.0.0.1 --port 8091 --allow-private-targets
 ```
 
-## 后续接入
+另开终端 `npm run dev`；Vite 将 `/api` 和 `/agent` 代理到 8091。该开发参数仅用于 localhost HTTP 登录和本地真实测试目标，生产服务不启用。前端只调用真实 API；后端未运行时显示连接错误。生产构建使用 `npm run build`。
 
-`VITE_DATA_MODE=api` 选择真实 API 适配器；原型默认 demo。此开关只选择数据层，**不会创建后端**。开发代理将 `/api` 转发至 `127.0.0.1:8080`；生产需配置同域反向代理或设置 `VITE_API_BASE_URL`。`VITE_` 变量会进入公开前端包，不应存放秘密。
+```powershell
+python -m unittest discover -s tests -p 'test_*.py'
+node tests/test_frontend.mjs
+npm run build
+```
 
-分页与 JSON 命名暂按 `docs/design/ui-v0.1.md` 和 `docs/design/vps-v0.2.md` 中的草案约定。真实后端尚未运行或验收，当前不应将原型用作生产监控系统。
+生产检测默认仅接受公网 HTTP/HTTPS 与公网 VPS 地址，跳转重新校验、TLS 正常验证；不会把主控内网服务作为公开监控目标。公网登录、管理员修改和探针上报要求 HTTPS（菜单 8 配置），HTTP 入口仅支持公开查看。管理员写接口由后端会话、CSRF 和来源检查保护；公开 GET 响应不包含密码、探针令牌或安装码。
+
+## 代码
+
+`src/` 为公开页面和管理界面，`backend/` 为真实检测、调度、权限和数据库，`agent/` 为 Linux 探针及安装器，`scripts/deploy/` 为校验、更新、HTTPS 和卸载。实用版的接口与部署约定见 [v0.3 设计](docs/design/live-v0.3.md)。

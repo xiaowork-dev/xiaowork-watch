@@ -157,6 +157,20 @@ class UninstallTests(unittest.TestCase):
         self.assertFalse((self.root / "installed.json").exists())
         self.assert_entries_removed()
 
+    def test_live_purge_stops_backend_and_cleans_private_database(self):
+        data = self.root / 'shared' / 'data'
+        data.mkdir(mode=0o700)
+        (data / 'watch.sqlite3').write_bytes(b'private monitoring and admin database fixture')
+        path = self.root / 'releases' / SHA / 'release.json'
+        value = json.loads(path.read_text(encoding='utf-8'))
+        value['kind'] = 'monitoring-server'
+        path.write_text(json.dumps(value), encoding='utf-8')
+        with self.runtime():
+            self.uninstall()
+        self.assertIn(['systemctl', 'disable', '--now', 'xiaowork-watch-backend.service'], self.calls)
+        self.assertFalse(self.root.exists())
+        self.assert_entries_removed()
+
     def test_purge_inspects_transient_update_files_only_after_acquiring_lock(self):
         transient = self.root / ".download-running-update"
         transient.write_text("in-progress update", encoding="utf-8")

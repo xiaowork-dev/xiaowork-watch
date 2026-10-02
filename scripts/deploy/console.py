@@ -43,6 +43,7 @@ class Paths:
     timer: Path = Path("/etc/systemd/system/xiaowork-watch-update.timer")
     tls_service: Path = Path("/etc/systemd/system/" + TLS_SERVICE)
     tls_timer: Path = Path("/etc/systemd/system/" + TLS_TIMER)
+    backend_service: Path = Path("/etc/systemd/system/xiaowork-watch-backend.service")
 
 
 DEFAULT_PATHS = Paths()
@@ -282,6 +283,18 @@ def ensure_control_entry(manager, paths=DEFAULT_PATHS, locked=None, refresh=Fals
         return True
 
 
+def _site_alias(text, domain):
+    """Route the preserved public Host to our inner vhost on shared ports."""
+    domain = _domain(domain)
+    def replace(match):
+        names = list(dict.fromkeys(match.group(1).split() + [domain]))
+        return "server_name " + " ".join(names) + ";"
+    value, count = re.subn(r"server_name\s+([^;]+);", replace, text, count=1)
+    if not count:
+        raise ConsoleError("受控网站缺少 server_name 配置。")
+    return value
+
+
 def configure_proxy(manager, domain, paths=DEFAULT_PATHS, locked=None):
     domain = _domain(domain)
     with _lock(manager, locked):
@@ -300,21 +313,25 @@ def configure_proxy(manager, domain, paths=DEFAULT_PATHS, locked=None):
         if port == 80:
             raise ConsoleError("网站已监听 80 端口，无需新增 80 端口反代；请直接配置原站点域名。")
         upstream_host = config.get("healthHost", "")
-        upstream_host = _domain(upstream_host) if upstream_host else "127.0.0.1"
+        upstream_host = "$http_host" if config.get("backendEnabled") else (_domain(upstream_host) if upstream_host else "127.0.0.1")
         # The site's managed config must still belong to this installation.
         if not _owned(paths.nginx_site, manager, "site", paths):
             raise ConsoleError("未找到属于此安装的 Nginx 网站配置。")
         _require_owned(paths.nginx_proxy, manager, "proxy", paths)
         old = _read_regular(paths.nginx_proxy) if paths.nginx_proxy.exists() else None
         old_mode = stat.S_IMODE(paths.nginx_proxy.stat().st_mode) if old is not None else 0o644
+        old_site = _read_regular(paths.nginx_site) if config.get("backendEnabled") else None
+        site_mode = stat.S_IMODE(paths.nginx_site.stat().st_mode) if old_site is not None else 0o644
         conf = (_header(manager) + "server {\n    listen 80;\n    server_name " + domain + ";\n"
                 "    location / {\n        proxy_pass http://127.0.0.1:" + str(port) + ";\n"
                 "        proxy_set_header Host " + upstream_host + ";\n"
                 "        proxy_set_header X-Real-IP $remote_addr;\n"
                 "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
                 "        proxy_set_header X-Forwarded-Proto $scheme;\n    }\n}\n")
-        _write(paths.nginx_proxy, conf)
         try:
+            if old_site is not None:
+                _write(paths.nginx_site, _site_alias(old_site, domain), site_mode)
+            _write(paths.nginx_proxy, conf)
             check = _run(["nginx", "-t"])
             if "conflicting server name" in check.lower():
                 raise ConsoleError("Nginx 报告域名冲突；请先检查已有站点的域名配置。")
@@ -322,8 +339,11 @@ def configure_proxy(manager, domain, paths=DEFAULT_PATHS, locked=None):
             config["proxyDomain"] = domain
             _write_config(manager, config)
         except BaseException:
+            if old_site is not None:
+                _write(paths.nginx_site, old_site, site_mode)
             if old is None:
-                paths.nginx_proxy.unlink()
+                if paths.nginx_proxy.exists():
+                    paths.nginx_proxy.unlink()
             else:
                 _write(paths.nginx_proxy, old, old_mode)
             try:
@@ -424,6 +444,8 @@ def _proxy_location(port, host):
 
 def _tls_proxy(manager, domain, config, folders, tls_domain=None, http_domains=None):
     port, host = _upstream(config)
+    if config.get("backendEnabled"):
+        host = "$http_host"
     domains = http_domains or domain
     conf = (_header(manager) + "server {\n    listen 80;\n    server_name " + domains + ";\n"
             "    location ^~ /.well-known/acme-challenge/ {\n        root " + _nginx_path(folders["acme"]) + ";\n"
@@ -533,8 +555,17 @@ def _https_health(manager, domain):
             raw = response.read(1024 * 1024 + 1)
             value = json.loads(raw) if len(raw) <= 1024 * 1024 else None
             if (response.status == 200 and isinstance(value, dict) and type(value.get("schema")) is int
-                    and value["schema"] == 1 and value.get("commit") == sha and value.get("kind") == "frontend-prototype"):
-                return
+                    and value["schema"] == 1 and value.get("commit") == sha
+                    and value.get("kind") in ("frontend-prototype", "monitoring-server")):
+                if value["kind"] == "frontend-prototype":
+                    return
+                connection.request("GET", "/api/health", headers={"Host": domain, "Cache-Control": "no-cache"})
+                api_response = connection.getresponse()
+                api_raw = api_response.read(16385)
+                api_value = json.loads(api_raw) if len(api_raw) <= 16384 else None
+                if (api_response.status == 200 and isinstance(api_value, dict) and api_value.get("code") == 0
+                        and isinstance(api_value.get("data"), dict) and api_value["data"].get("release") == sha):
+                    return
             last_error = "HTTPS 未返回当前网站版本"
         except Exception as error:
             last_error = str(error)
@@ -627,6 +658,8 @@ def configure_https(manager, domain, email, paths=DEFAULT_PATHS, locked=None):
         for path, kind in ((paths.nginx_proxy, "proxy"), (paths.tls_service, "tls-service"), (paths.tls_timer, "tls-timer")):
             _require_owned(path, manager, kind, paths)
         tracked = (paths.nginx_proxy, paths.tls_service, paths.tls_timer, manager.root / "config.json")
+        if config.get("backendEnabled"):
+            tracked += (paths.nginx_site,)
         snapshots = {path: (_read_regular(path), stat.S_IMODE(path.stat().st_mode))
                      for path in tracked if path.exists()}
         old_proxy = snapshots.get(paths.nginx_proxy, ("",))[0]
@@ -644,6 +677,9 @@ def configure_https(manager, domain, email, paths=DEFAULT_PATHS, locked=None):
         active = _unit_state(TLS_TIMER, "is-active") if paths.tls_timer in snapshots else False
         timer_touched = False
         try:
+            if config.get("backendEnabled"):
+                site_text, site_mode = snapshots[paths.nginx_site]
+                _write(paths.nginx_site, _site_alias(site_text, domain), site_mode)
             if not _certbot_available() or not shutil.which("openssl"):
                 _run(["apt-get", "update"], timeout=600)
                 _run(["apt-get", "install", "-y", "certbot", "openssl"], timeout=600)
@@ -733,8 +769,8 @@ def _internal_uninstall_targets(manager):
                 metadata = json.loads(text)
             except ValueError as error:
                 raise ConsoleError("安装记录无效，拒绝卸载。") from error
-            if not isinstance(metadata, dict) or metadata.get("kind") != "frontend-prototype":
-                raise ConsoleError("安装记录不属于前端原型，已保留。")
+            if not isinstance(metadata, dict) or metadata.get("kind") not in ("frontend-prototype", "monitoring-server"):
+                raise ConsoleError("安装记录不属于本项目，已保留。")
         elif text.strip() != MARKER_VALUE:
             raise ConsoleError("安装完成标记不属于此安装，已保留。")
         targets.append(path)
@@ -791,7 +827,7 @@ def _purge_plan(manager):
     shared = root / "shared"
     if shared.exists():
         for child in shared.iterdir():
-            if child.name not in {"assets", "acme", "letsencrypt", "certbot-work", "certbot-logs"}:
+            if child.name not in {"assets", "acme", "letsencrypt", "certbot-work", "certbot-logs", "data"}:
                 raise ConsoleError("共享目录含有未登记内容，已保留：" + str(child))
             if child.is_symlink() or not child.is_dir():
                 raise ConsoleError("共享数据目录不安全，已保留：" + str(child))
@@ -806,7 +842,7 @@ def _purge_plan(manager):
             except (ValueError, OSError) as error:
                 raise ConsoleError("历史发布信息无效，已保留：" + str(release)) from error
             if (not isinstance(metadata, dict) or type(metadata.get("schema")) is not int or metadata["schema"] != 1
-                    or metadata.get("commit") != release.name or metadata.get("kind") != "frontend-prototype"):
+                    or metadata.get("commit") != release.name or metadata.get("kind") not in ("frontend-prototype", "monitoring-server")):
                 raise ConsoleError("历史发布信息不属于此安装，已保留：" + str(release))
     # st_dev alone misses bind mounts. Linux mountinfo includes those mountpoints.
     if sys.platform.startswith("linux"):
@@ -879,7 +915,8 @@ def uninstall(manager, confirm=False, paths=DEFAULT_PATHS, locked=None, purge=Fa
         purge_identity = _purge_plan(manager) if purge else None
         global_paths = [(paths.nginx_site, "site"), (paths.nginx_proxy, "proxy"),
                         (paths.wrapper, "wrapper"), (paths.service, "service"), (paths.timer, "timer"),
-                        (paths.tls_service, "tls-service"), (paths.tls_timer, "tls-timer")]
+                        (paths.tls_service, "tls-service"), (paths.tls_timer, "tls-timer"),
+                        (paths.backend_service, "backend-service")]
         for path, kind in global_paths:
             _require_owned(path, manager, kind, paths)
         internal = _internal_uninstall_targets(manager)
@@ -889,7 +926,8 @@ def uninstall(manager, confirm=False, paths=DEFAULT_PATHS, locked=None, purge=Fa
         config_path = manager.root / "config.json"
         old_config = (_read_regular(config_path), stat.S_IMODE(config_path.stat().st_mode))
         timer_states = {}
-        for path, name in ((paths.timer, "xiaowork-watch-update.timer"), (paths.tls_timer, TLS_TIMER)):
+        for path, name in ((paths.timer, "xiaowork-watch-update.timer"), (paths.tls_timer, TLS_TIMER),
+                           (paths.backend_service, "xiaowork-watch-backend.service")):
             if path in snapshots:
                 timer_states[name] = (_unit_state(name, "is-enabled"), _unit_state(name, "is-active"))
         nginx_active = _unit_state("nginx.service", "is-active")
@@ -907,6 +945,8 @@ def uninstall(manager, confirm=False, paths=DEFAULT_PATHS, locked=None, purge=Fa
                 _run(["systemctl", "disable", "--now", TLS_TIMER])
             if paths.tls_service in snapshots:
                 _run(["systemctl", "stop", TLS_SERVICE])
+            if paths.backend_service in snapshots:
+                _run(["systemctl", "disable", "--now", "xiaowork-watch-backend.service"])
             for path in (paths.nginx_site, paths.nginx_proxy):
                 if path in snapshots:
                     path.unlink()
@@ -915,11 +955,11 @@ def uninstall(manager, confirm=False, paths=DEFAULT_PATHS, locked=None, purge=Fa
                 _run(["nginx", "-t"])
                 if nginx_active:
                     _run(["systemctl", "reload", "nginx"])
-            for path in (paths.service, paths.timer, paths.tls_service, paths.tls_timer, paths.wrapper):
+            for path in (paths.service, paths.timer, paths.tls_service, paths.tls_timer, paths.backend_service, paths.wrapper):
                 if path in snapshots:
                     path.unlink()
                     removed.append(path)
-            if any(path in snapshots for path in (paths.service, paths.timer, paths.tls_service, paths.tls_timer)):
+            if any(path in snapshots for path in (paths.service, paths.timer, paths.tls_service, paths.tls_timer, paths.backend_service)):
                 _run(["systemctl", "daemon-reload"])
             tombstone = _purge_move(manager, purge_identity) if purge else None
         except BaseException:
@@ -996,13 +1036,14 @@ def _status_text(manager):
             + "\n可回退版本：" + version(status.get("previous"))
             + "\n自动更新：" + ("开启" if status.get("autoUpdate", True) else "暂停")
             + "\n反代域名：" + str(config.get("proxyDomain") or "未配置")
-            + "\nHTTPS：" + ("已配置（独立自动续期）" if config.get("httpsEnabled") else "未配置"))
+            + "\nHTTPS：" + ("已配置（独立自动续期）" if config.get("httpsEnabled") else "未配置")
+            + "\n监控模式：" + ("真实检测，公开只读 /admin 管理" if status.get("kind") == "monitoring-server" else "旧前端原型"))
 
 
 def _uninstall_dialog(manager, terminal, locked, paths=DEFAULT_PATHS):
     _say(terminal, "\n========== 彻底卸载 xiaowork Watch ==========\n"
          "将停止网站自动更新和证书续期，移除本项目的 HTTP/HTTPS 站点、管理命令及服务入口。\n"
-         "将永久清理本项目的历史发布包、安装配置和证书，安装目录：" + str(manager.root) + "\n"
+         "将永久清理本项目的监控数据、管理员账号、历史发布包、安装配置和证书，安装目录：" + str(manager.root) + "\n"
          "Nginx、Certbot 和其他站点保留。")
     if _ask(terminal, "输入 UNINSTALL 确认卸载（输入 0 或直接回车取消）：") != "UNINSTALL":
         _say(terminal, "已取消卸载。")
@@ -1038,7 +1079,7 @@ def run_menu(manager, locked, paths=DEFAULT_PATHS):
         return 1
     with terminal:
         while True:
-            _say(terminal, "\n========== xiaowork Watch ==========\n服务器管理\n\n  1. 查看状态\n  2. 配置域名 HTTP 反代\n  3. 更新网站\n  4. 回退上一版本\n  5. 自动更新开关\n  6. 查看更新日志\n  7. 彻底卸载 xiaowork Watch\n  8. 配置 HTTPS\n  0. 退出\n")
+            _say(terminal, "\n========== xiaowork Watch ==========\n服务器管理\n\n  1. 查看状态\n  2. 配置域名 HTTP 反代\n  3. 更新网站\n  4. 回退上一版本\n  5. 自动更新开关\n  6. 查看更新日志\n  7. 彻底卸载 xiaowork Watch\n  8. 配置 HTTPS\n  9. 重置管理员密码\n  0. 退出\n")
             choice = _ask(terminal, "请选择：")
             if choice in (None, "0"):
                 return 0
@@ -1095,6 +1136,12 @@ def run_menu(manager, locked, paths=DEFAULT_PATHS):
                         continue
                     result = configure_https(manager, domain, email, paths=paths, locked=locked)
                     _say(terminal, "HTTPS 已配置：" + result["url"] + "\n专用证书续期任务已开启，暂停网站自动更新不影响续期。")
+                elif choice == "9":
+                    if (_ask(terminal, "重置密码并退出已有管理员会话？输入 yes/y 确认：") or "").lower() in {"yes", "y"}:
+                        with _lock(manager, locked):
+                            _say(terminal, manager.reset_admin(capture=True))
+                    else:
+                        _say(terminal, "已取消密码重置。")
                 else:
                     _say(terminal, "请选择菜单中的编号。")
             except Exception as error:

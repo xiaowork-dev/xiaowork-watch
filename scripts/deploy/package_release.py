@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create a deterministic frontend release; never package source secrets."""
+"""Create a deterministic application release; never package credentials/data."""
 import argparse
 import gzip
 import hashlib
@@ -26,9 +26,23 @@ def package(project, output, commit):
     if 'index.html' not in files:
         raise ValueError('dist/index.html is missing')
     version = json.loads((project / 'package.json').read_text(encoding='utf-8'))['version']
-    files['release.json'] = (json.dumps({'schema': 1, 'kind': 'frontend-prototype', 'commit': commit, 'version': version}, sort_keys=True) + '\n').encode()
+    live = (project / 'backend/server.py').is_file()
+    kind = 'monitoring-server' if live else 'frontend-prototype'
+    files['release.json'] = (json.dumps({'schema': 1, 'kind': kind, 'commit': commit, 'version': version}, sort_keys=True) + '\n').encode()
     files['.deploy/manage.py'] = (project / 'scripts/deploy/manage.py').read_bytes()
     files['.deploy/console.py'] = (project / 'scripts/deploy/console.py').read_bytes()
+    if live:
+        files['.deploy/runtime.py'] = (project / 'scripts/deploy/runtime.py').read_bytes()
+        for source in sorted((project / 'backend').rglob('*.py')):
+            if source.is_symlink():
+                raise ValueError('Backend source contains a symlink')
+            if '__pycache__' not in source.parts:
+                files['.backend/' + source.relative_to(project / 'backend').as_posix()] = source.read_bytes()
+        for name in ('agent.py', 'install.sh'):
+            source = project / 'agent' / name
+            if source.is_symlink() or not source.is_file():
+                raise ValueError('Agent source is missing or unsafe')
+            files['.agent/' + name] = source.read_bytes()
     output.mkdir(parents=True, exist_ok=True)
     archive = output / 'xiaowork-watch-web.tar.gz'
     with archive.open('wb') as raw:
@@ -42,7 +56,7 @@ def package(project, output, commit):
                     tar.addfile(entry, io.BytesIO(content))
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     archive.with_name(archive.name + '.sha256').write_text(digest + '  ' + archive.name + '\n', encoding='ascii')
-    print('Packaged frontend prototype ' + version + ' at ' + commit)
+    print('Packaged ' + kind + ' ' + version + ' at ' + commit)
 
 
 if __name__ == '__main__':

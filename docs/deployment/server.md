@@ -1,156 +1,110 @@
-# 服务器部署与 GitHub 自动更新
+# 服务器部署与更新（v0.3.0）
 
-当前 v0.2.6 提供两条部署路径：自己拉取源码构建，或通过中文终端菜单部署 GitHub 的发布包。两种方式部署的都是**前端交互原型**；尚无真实主控后端、数据库或 Linux VPS 探针。首次访问的网站、VPS、测试节点及检测历史为空，由自己添加。已有浏览器中的配置、历史和旧样例不会自动清除。
+本版本包含真实网站检测、SQLite 存储、管理员登录和 Linux VPS / 测试节点探针。公开页 `/` 只读，后台 `/admin` 登录后可修改。原型中的浏览器数据仍保留，但不会自动导入真实数据库。
 
-## 方式一：一键安装并自动更新
+## 一键安装和旧版升级
 
-支持使用 systemd 的 Ubuntu/Debian。以 root 或有 sudo 权限的账号在自己的服务器执行：
+支持 Ubuntu/Debian + systemd。在自己的 SSH 终端执行：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/xiaowork-dev/xiaowork-watch/main/install.sh | sudo bash
 ```
 
-在 SSH 终端执行后，未安装时首先显示小菜单：**1. 部署 / 2. 彻底卸载 xiaowork Watch / 0. 退出**。选择部署后，脚本安装 Nginx、Python 3、curl 和 CA 证书，下载最新完整的 GitHub 前端发布包，校验 SHA256，并启动自动更新定时器。成功后自动进入管理菜单。服务器不需要 Node.js，不需要把 SSH 私钥提供给 Codex 或配置 GitHub Secrets。
+首次显示“1. 部署 / 2. 彻底卸载 / 0. 退出”，选择部署；成功后进入管理菜单。默认安装 `/opt/xiaowork-watch`，网站端口 8088。自选目录和端口可加 `--path /opt/watch --port 8088`（服务隔离要求使用 /opt 或 /srv 等系统目录，不能放在 /home 或 /root）。无交互部署明确加 `--non-interactive`。
 
-安装后运行 `sudo xiaowork-watch` 或再次执行安装链接，即可打开管理菜单：查看状态、域名反代、更新、回退、自动更新开关、日志、卸载，以及 **8. 配置 HTTPS**。菜单输入从 `/dev/tty` 读取，支持 `curl | sudo bash`；无交互终端时不会默认开始部署。
+**v0.2.x 首次升级必须重新运行上面的最新安装链接。** 旧更新工具只支持静态原型包，会保留旧版而拒绝新主控包；新链接获取最新已发布管理工具，安装真实后端并保留域名、HTTPS、旧发布包及证书。无需重装 Nginx，不连接用户服务器 SSH。
 
-菜单收到无效 UTF-8 输入时，会拒绝整行并在原提示处要求重新输入。请将 SSH 客户端编码设为 UTF-8，再输入域名或确认命令；正常输入、退出和取消操作不受影响。
-
-默认目录 `/opt/xiaowork-watch`，默认监听 **8088**，浏览器访问 `http://服务器IP:8088`。如云安全组或防火墙限制入站，需要允许所选端口。脚本新增专用 Nginx 站点，不删除其他站点。
-
-自选端口、域名和目录：
+首次生成 `admin` 账号及随机密码，直接在安装终端输出，账号不写进前端、GitHub 或公开接口。请保存密码，再进入 `https://自己的域名/admin` 登录。忘记密码：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xiaowork-dev/xiaowork-watch/main/install.sh | sudo bash -s -- --port 8088 --domain watch.example.com --path /opt/xiaowork-watch
+sudo xiaowork-watch reset-admin
 ```
 
-`watch.example.com` 是占位域名，替换为自己的域名并配置 DNS。上面的参数选择原站点端口和域名；管理菜单中的“域名反代”另建 80 端口 HTTP 入口，转发到当前本地站点端口。反代配置先检查、重新加载，失败恢复原配置；不会修改其他站点。同域名已有站点时先自行处理冲突。若网站本身已经监听 80，无需再建立 80 到 80 的反代。
+重置会撤销现有管理员登录会话。菜单 9 同样支持，确认接受 `yes/y`，不区分大小写。
 
-首次部署提供 HTTP。需要 HTTPS 时，在管理菜单选 8，按后面的步骤申请证书。已启用 HTTPS 的站点不会因为误选 HTTP 反代而静默降级。
-
-安装目录必须是空目录，或已有本安装器的标记。已完整安装后，重复执行脚本会打开管理菜单，单纯打开菜单不会更新网站或恢复自动更新。更改原站点端口请编辑专用 Nginx 配置及 `config.json` 中的本地健康检查地址，再检查、重新加载。失败安装会撤下本次新建的配置，保留已下载文件供重试；同名配置已有其他内容时会停止，不覆盖其他项目。
-
-无人值守时显式跳过菜单：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/xiaowork-dev/xiaowork-watch/main/install.sh | sudo bash -s -- --non-interactive
-```
-
-旧 v0.2.1 已安装的服务器可直接运行 `sudo xiaowork-watch update`，成功后运行 `sudo xiaowork-watch` 打开新菜单；也可再次执行安装链接获取菜单。旧版兼容入口只加载新版管理工具，不自动更改当前网站版本或回退暂停状态。
-
-更新与管理：
+## 管理菜单
 
 ```bash
 sudo xiaowork-watch
 sudo xiaowork-watch status
 sudo xiaowork-watch update
-sudo xiaowork-watch rollback
-sudo xiaowork-watch proxy watch.example.com
 sudo xiaowork-watch auto-update off
 sudo xiaowork-watch auto-update on
+sudo xiaowork-watch rollback
 ```
 
-- 自动更新约每 15 分钟查询一次 GitHub，并附带随机延迟。
-- `update` 立即检查并更新，重新允许自动更新。
-- `rollback` 返回前一版，并把 `autoUpdate` 设置为 false，避免下一次检查马上装回刚退掉的版本。确定新版可以使用后执行 `update` 恢复。
-- 如需完全关闭定时检查：`sudo systemctl disable --now xiaowork-watch-update.timer`。恢复：`sudo systemctl enable --now xiaowork-watch-update.timer`。
-- 日志：`sudo journalctl -u xiaowork-watch-update.service -n 50 --no-pager`。
+main 推送通过检查后发布，服务器约每 15 分钟查询一次最新完整发布包。更新校验 SHA256、提交与包类型，原子切换前后端代码并重启主控；网站或主控健康检查失败会恢复原版和配置。SQLite 位于 `shared/data`，更新保留监控、历史、账号和探针凭据。
 
-### 配置 HTTPS
+回退会暂停自动更新，并同时回退前后端代码。为避免退回模拟检测，不允许实用版回退到 v0.2 的原型；首个实用版没有可回退的实用版本。数据库不随代码回退，后续涉及数据结构变化的版本需提供独立迁移方案。
 
-先把目标域名的 **A 记录指向 VPS 的 IPv4 地址**，并开放入站 **80 和 443**。当前反代入口仅监听 IPv4，请移除该域名的 AAAA 记录，避免验证请求走向未托管的 IPv6 地址。证书申请使用 Let's Encrypt HTTP-01 验证，需要公网能访问域名的 80 端口。已有旧菜单时先输入 0 退出，在 Shell 中执行：
+服务日志：
 
 ```bash
-sudo xiaowork-watch update
-sudo xiaowork-watch
+sudo journalctl -u xiaowork-watch-backend.service -n 50 --no-pager
+sudo journalctl -u xiaowork-watch-update.service -n 50 --no-pager
 ```
 
-选 **8. 配置 HTTPS**。输入自己的域名和邮箱；当前已配置的反代域名会作为默认值。确认 DNS、端口及 Let's Encrypt 服务条款后，输入 `yes` 或 `y` 开始申请（不区分大小写），其他输入取消。成功后 HTTP 自动跳转 HTTPS，Nginx 反代通过 443 提供加密访问，本地原站端口和更新健康检查继续使用 HTTP。
+## 域名和 HTTPS
 
-程序按需安装 Certbot 和 OpenSSL，以 webroot 方式申请证书，只操作本项目专用的反代配置。证书、账户和日志位于安装目录下的 `shared/letsencrypt`、`shared/certbot-work`、`shared/certbot-logs`；验证文件位于 `shared/acme`。账号与私钥不放入 GitHub 或网页公开目录。签发或配置检查失败时恢复原站点配置；重新申请不强制每日签发新证书。
+管理菜单 2 配置 HTTP 域名反代，菜单 8 配置 HTTPS。域名 A 记录指向服务器 IPv4，开放 80/443，移除未由此站点托管的 AAAA 记录。输入域名和邮箱，确认 DNS、端口及 Let's Encrypt 条款后，输入 `yes` 或 `y` 申请。
 
-已有全局 `/etc/letsencrypt/cli.ini` 或用户级 Certbot 配置不再阻止 HTTPS。工具使用系统 apt 的 Certbot，在独立进程中排除默认配置来源，并将证书、账户、工作目录与日志限制在本项目的专属目录；申请及续期均禁用目录 hooks 和保存的前置、后置、部署 hooks。无需删除或修改已有 Certbot 配置。
-
-本项目的 `xiaowork-watch-certbot-renew.timer` 每天检查续期，带随机延迟；只有接近到期时 Certbot 才更新证书。续期成功后检查并重载 Nginx。暂停网页自动更新或回退网页版本不会停掉证书续期。查看日志与立即检查：
+Certbot 使用本项目的独立证书、账户、工作和日志目录，不读取或修改已有全局/用户配置，不执行全局 hooks。签发失败恢复原反代，成功后 HTTP 跳转 HTTPS，专用定时器自动续期。主控默认 8091 只监听 loopback（网站自选 8091 时主控改用 8092），公开访问统一通过 Nginx。公网管理员登录、修改及探针上报要求 HTTPS，HTTP 仅支持公开查看。
 
 ```bash
-sudo journalctl -u xiaowork-watch-certbot-renew.service -n 50 --no-pager
 sudo xiaowork-watch renew-https
+sudo journalctl -u xiaowork-watch-certbot-renew.service -n 50 --no-pager
 ```
 
-浏览器本地数据按域名、协议和端口分别保存。从 HTTP 切换到 HTTPS 后属于新的访问来源，列表会首次以空数据开始；HTTP 来源中的旧数据仍在原浏览器中。当前原型没有服务器数据库，不会自动跨来源迁移配置。
+## 真实检测与探针
 
-DNS 未生效、错误 AAAA 记录、80/443 未开放或已有域名站点冲突时，应先修正再尝试。证书签发与公网验证在自己 VPS 上执行；CI 使用本地临时证书检查 Nginx、反代和挑战路径，并在 Ubuntu/Debian 上通过真实 Certbot 离线检查配置隔离与续期参数。[Certbot 官方说明](https://eff-certbot.readthedocs.io/en/stable/using.html)介绍 webroot 验证与自动续期。
+管理员在后台新增网站并设置间隔（30–86400 秒）和超时（1000–30000 毫秒）；主控自动检测，不依赖浏览器保持打开。非 2xx/3xx、DNS、网络超时和 TLS 验证失败会记录失败详情。GET/HEAD 不上传请求体或凭据。目标仅限公网地址，每次 HTTP 跳转重新验证目标，防止请求落入主控内网。
 
-### 彻底卸载
+添加 VPS / 测试节点后，在对应记录生成安装命令，粘贴到对应 Ubuntu/Debian SSH 终端。公网安装要求 HTTPS 主控，命令固定探针 SHA256，使用 10 分钟单次安装码兑换角色与记录绑定的凭据。安装创建专用受限用户、服务和配置，探针只主动连主控。
 
-管理菜单选择 **7. 彻底卸载 xiaowork Watch**，或运行 `sudo xiaowork-watch uninstall` 打开卸载确认。提示列出清理范围和安装目录，只需输入一次 `UNINSTALL`；输入 0、回车或断开输入会取消。
+VPS 每 30 秒心跳，超过 90 秒显示离线；测试节点每分钟向选定 VPS 发出 5 个真实 Ping，展示回复平均延迟与丢包。心跳离线与 Ping 无回复是独立状态；节点离线不生成虚假结果，旧数据标明过期。VPS 需允许来自节点的 ICMP；检测无需开放 SSH 或管理端口给主控。
 
-完整卸载先核验入口和目录归属，停用本项目的网站更新和证书续期任务，再移除站点、反代、管理命令和 systemd 配置。随后清理本安装目录中的 `releases/`、`shared/`（包含证书和账户）、`config.json`、版本指针及目录标记。Nginx/Certbot 软件、其他站点、全局证书任务和手动源码部署目录保留。当前原型的监控配置在浏览器本地存储中，服务器卸载不会清除浏览器的数据。
+探针日志和卸载：
 
-旧版本或 Nginx 已停止时，不必先更新网站，退出当前菜单后执行最新链接：
+```bash
+sudo journalctl -u xiaowork-watch-agent.service -n 50 --no-pager
+curl -fsS https://自己的主控域名/agent/install.sh -o watch-agent-install.sh
+sudo bash watch-agent-install.sh --uninstall
+```
+
+## 彻底卸载主控
+
+菜单 7 输入 `UNINSTALL`，清理本项目网站、反代、后端服务、更新和续期任务，以及本项目的监控数据库、账号、历史包、配置与证书。Nginx、Certbot 及其他站点保留。已经安装在其他 VPS 上的探针需分别卸载，主控不远程执行卸载命令。
+
+旧安装或网站异常时可直接用最新工具：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/xiaowork-dev/xiaowork-watch/main/install.sh | sudo bash -s -- --uninstall --purge
 ```
 
-自选安装目录加 `--path /自己的目录`。该方式从最新完整 GitHub Release 获取管理工具，仍要求输入 `UNINSTALL`。无交互终端时明确加 `--confirm`。
+无交互卸载加 `--confirm`；自选目录加 `--path`。仅撤下服务、保留数据可用 `sudo xiaowork-watch uninstall --confirm`（不加 `--purge`）。归属或路径检查失败会停止并显示原因。
 
-如需保留发布包、配置和证书，使用 `sudo xiaowork-watch uninstall --confirm` 或安装链接只加 `--uninstall`。明确无人值守彻底清理时使用 `sudo xiaowork-watch uninstall --purge --confirm`。
+## 手动源码部署
 
-等待更新或证书续期释放锁时会显示提示。Nginx 已停止时只检查配置，不尝试启动或重载。清理前发现未知文件、外部链接或挂载目录会停止并显示具体路径；入口操作失败会恢复原配置和定时任务。删除安装目录失败时会明确说明入口已卸载及残留数据的位置，便于检查后处理，不会显示完整卸载成功。
-
-程序存储结构：
-
-```text
-/opt/xiaowork-watch/
-  .xiaowork-watch-managed    安装目录标记
-  .installation-complete    完整安装标记
-  config.json               自动更新开关与本地健康检查地址
-  installed.json            当前版本记录
-  current -> releases/SHA   当前网页版本
-  previous -> releases/SHA  前一版
-  control -> releases/SHA/.deploy  稳定管理入口，网页回退不降级菜单
-  releases/                 完整发布包解压目录
-  shared/assets/            跨版本保留的静态资源
-  shared/acme/              HTTP-01 验证目录
-  shared/letsencrypt/       本项目证书和账户（私有）
-  shared/certbot-work/      本项目证书工作目录（私有）
-  shared/certbot-logs/      本项目证书日志（私有）
-```
-
-每次更新先下载到独立目录，核对发布标签、包校验和、文件路径和 `release.json` 中的提交 SHA。完整验证后原子切换 `current`；本地 HTTP 健康检查失败会恢复原版本。旧版本与旧 hashed assets 保留，不自动清理。此流程只管理前端文件，未来数据库与探针升级须另行接入，不在当前脚本中执行。
-
-## 方式二：自己拉取源码构建
-
-保留普通 Git 部署流程。在服务器安装受项目支持的 Node.js 与 npm，首次部署：
+保留 Git 源码部署方式，安装 Python 3.9+、Node.js 20.19+ 或 22.12+、Nginx。源码目录与一键安装目录分开使用：
 
 ```bash
 git clone https://github.com/xiaowork-dev/xiaowork-watch.git /opt/xiaowork-watch-source
 cd /opt/xiaowork-watch-source
 npm ci
 npm run build
+sudo useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --comment 'xiaowork Watch backend' xiaowork-watch
+sudo install -d -o xiaowork-watch -g xiaowork-watch -m 700 /var/lib/xiaowork-watch
+sudo -u xiaowork-watch python3 backend/server.py --data-dir /var/lib/xiaowork-watch --init-admin
 ```
 
-将 Nginx 的网站根目录指向 `/opt/xiaowork-watch-source/dist`，配置端口或域名后运行 `sudo nginx -t`，通过后重新加载 Nginx。`npm run dev` 和 `npm run preview` 不用作正式托管服务。
+将后端作为自己的 systemd 服务托管，使用 `User=xiaowork-watch`、`Group=xiaowork-watch`，执行 `/usr/bin/python3 /opt/xiaowork-watch-source/backend/server.py --host 127.0.0.1 --port 8091 --data-dir /var/lib/xiaowork-watch`，配置 `Restart=on-failure`、`UMask=0077`。后端源码目录须允许服务用户读取。
 
-后续更新，每步成功后再执行下一步：
+Nginx root 指向 `/opt/xiaowork-watch-source/dist`，SPA 用 `try_files $uri $uri/ /index.html`；`/api/`、`/agent/` 两个 `location ^~` 代理到 `http://127.0.0.1:8091`，保留 `Host $http_host` 和 `X-Forwarded-Proto $scheme`，设置 `client_max_body_size 64k`、`proxy_read_timeout 40s`，禁止隐藏文件并对 HTML/API 使用 no-cache/no-store。通过已有证书工具配置 HTTPS。
 
-```bash
-cd /opt/xiaowork-watch-source
-git pull --ff-only origin main
-npm ci
-npm run build
-```
+后续 `git pull --ff-only origin main` → `npm ci` → `npm run build` → 重启自己的后端服务并检查健康。手动部署不会使用一键安装器的自动更新/回退/卸载工具，数据目录持续保留。
 
-这条路径由你手动更新。源码构建目录和一键安装器目录各自独立；不要对同一个部署目录混用两种流程。配置自己的 Nginx 时，可参考一键安装脚本中的 no-cache HTML 和隐藏文件规则。源码部署的 `/assets` 直接来自 `dist/assets`，不要复制安装器专用的 `shared/assets` alias。
+## 文件与发布
 
-## GitHub 的自动发布流程
+安装目录的 `current`/`previous` 指向受验证代码包，`control` 指向稳定运维工具；`shared/assets` 保留 hashed 前端资源，`shared/data` 是仅后端用户可访问的 SQLite 数据目录，证书位于 `shared/letsencrypt`。发布包中的 `.backend`/`.agent`/`.deploy` 均由 Nginx 隐藏文件规则保护；探针源文件仅通过后端专用端点提供。
 
-`.github/workflows/release.yml` 在 main 每次推送后自动运行：安装锁定依赖 → 检查安装/更新测试 → 构建 Vue 前端 → 打包和生成 SHA256 → 创建草稿 Release → 上传完整资产 → 公开发布为 latest。
-
-发布标签为 `web-完整提交SHA`，资产为 `xiaowork-watch-web.tar.gz` 和同名 `.sha256`。只发布当前 main 的成功构建，旧提交重跑不能取代最新版本；已公开的同标签包不能被覆盖。前端发布包不包含 `.env`、源码、node_modules 或 OpenAI 发布配置。
-
-自己部署的服务器主动读取公开的 GitHub Release，无需 SSH 连接或访问凭据。GitHub 构建失败、网络失败、受 API 限流、校验失败或版本格式不认识时，服务器保留旧版。main 推送完成并不等于所有服务器已更新；通常需等待构建和下一次定时检查。首次发布尚未成功时，安装脚本会报没有完整发布包，需要等待 Actions 完成。
-
-如果以后同仓库开始发布真实主控或探针包，应为其定义单独更新通道，再调整此安装器；当前只接受 `frontend-prototype` 包，不把后端或未知资产当作前端安装。
+GitHub Actions 在 main 推送后检查 Ubuntu/Debian Certbot、真实本地 HTTP 与 Ping、权限、数据持久化、安装/更新/卸载，然后构建前端并发布 `monitoring-server` 包。没有测试或部署用户实际服务器；公网目标的最终可达性取决于部署服务器和节点的网络。
