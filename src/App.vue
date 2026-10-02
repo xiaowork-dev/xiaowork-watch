@@ -1,9 +1,13 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
-import { Activity, Radio, Plus, ChevronRight, RefreshCw, Ellipsis, CircleHelp, Play, Pause, Pencil, Trash2, X, ChevronLeft, LoaderCircle, Check, AlertCircle, Globe2, Clock3, ShieldCheck, FileClock } from 'lucide-vue-next'
+import { Activity, Radio, Plus, ChevronRight, RefreshCw, Ellipsis, CircleHelp, Play, Pause, Pencil, Trash2, X, ChevronLeft, LoaderCircle, Check, AlertCircle, Globe2, Clock3, ShieldCheck, FileClock, Server, Network } from 'lucide-vue-next'
 import { monitorsApi as api, isDemo } from './api/monitors'
 import MonitorForm from './components/MonitorForm.vue'
+import FleetView from './components/FleetView.vue'
 import StatusBadge from './components/StatusBadge.vue'
+const section = ref('web')
+const sectionTitle = computed(() => section.value === 'web' ? '网站监控' : section.value === 'vps' ? 'VPS 监控' : '测试节点')
+function navigate(value) { section.value = value; goBack(); document.title = sectionTitle.value + ' · xiaowork Watch' }
 const monitors = ref([]), loading = ref(true), pageError = ref(''), selected = ref(null), menuId = ref(null), formState = ref(null)
 const history = ref({ records: [], total: 0, page: 1, size: 8 }), historyLoading = ref(false), historyError = ref(''), checking = ref([]), busyIds = ref([])
 const toast = ref(null), deleteTarget = ref(null), deleting = ref(false), deleteError = ref(''), confirmDialog = ref(null), refreshTime = ref(null)
@@ -35,9 +39,9 @@ async function loadHistory(page = 1) {
  catch (error) { if (request === historyRequest) historyError.value = error.message }
  finally { if (request === historyRequest) historyLoading.value = false }
 }
-async function openDetail(id) { menuId.value = null; selected.value = id; history.value = { records: [], total: 0, page: 1, size: 8 }; await loadHistory(); await nextTick(); document.getElementById('detail-title')?.focus() }
+async function openDetail(id) { section.value = 'web'; menuId.value = null; selected.value = id; history.value = { records: [], total: 0, page: 1, size: 8 }; await loadHistory(); await nextTick(); document.getElementById('detail-title')?.focus() }
 function goBack() { selected.value = null; ++historyRequest; historyLoading.value = false; nextTick(() => document.getElementById('list-title')?.focus()) }
-function openForm(monitor = null) { if (formState.value || deleteTarget.value) throw new Error('请先完成或关闭当前弹窗'); menuId.value = null; formState.value = { monitor } }
+function openForm(monitor = null) { section.value = 'web'; if (formState.value || deleteTarget.value) throw new Error('请先完成或关闭当前弹窗'); menuId.value = null; formState.value = { monitor } }
 async function saveMonitor(value) {
  const editId = formState.value?.monitor?.id
  if (editId) await api.update(editId, value); else await api.create(value)
@@ -91,14 +95,18 @@ onMounted(() => {
 <template>
  <div class="app-shell">
   <aside class="sidebar">
-   <a class="brand" href="#" @click.prevent="goBack"><span class="brand-mark"><Activity :size="24" /></span><span>xiaowork<span class="brand-light">Watch</span></span></a>
+   <a class="brand" href="#" @click.prevent="navigate('web')"><span class="brand-mark"><Activity :size="24" /></span><span>xiaowork<span class="brand-light">Watch</span></span></a>
    <div class="workspace-label">工作空间</div>
-   <a class="nav-item active" href="#" @click.prevent="goBack"><Radio :size="18" />监控列表<span class="nav-count">{{monitors.length}}</span></a>
-   <div class="sidebar-bottom"><div class="version"><span>当前版本</span><b>v0.1</b></div><p>HTTP / HTTPS 监控</p><div class="account"><span class="avatar">X</span><div><b>个人工作空间</b><small>xiaowork</small></div></div></div>
+   <a :class="['nav-item',{active:section === 'web'}]" href="#web" :aria-current="section === 'web' ? 'page' : undefined" @click.prevent="navigate('web')"><Radio :size="18" />网站监控<span class="nav-count">{{monitors.length}}</span></a>
+   <a :class="['nav-item',{active:section === 'vps'}]" href="#vps" :aria-current="section === 'vps' ? 'page' : undefined" @click.prevent="navigate('vps')"><Server :size="18" />VPS 监控</a>
+   <a :class="['nav-item',{active:section === 'nodes'}]" href="#nodes" :aria-current="section === 'nodes' ? 'page' : undefined" @click.prevent="navigate('nodes')"><Network :size="18" />测试节点</a>
+   <div class="sidebar-bottom"><div class="version"><span>当前版本</span><b>v0.2 原型</b></div><p>网站 · VPS · 测试节点</p><div class="account"><span class="avatar">X</span><div><b>个人工作空间</b><small>xiaowork</small></div></div></div>
   </aside>
   <div class="main-shell">
-   <header class="topbar"><div class="breadcrumb"><span class="workspace-crumb">工作空间</span><ChevronRight :size="14" /><button @click="goBack">监控列表</button><template v-if="currentMonitor"><ChevronRight :size="14" /><span>{{currentMonitor.name}}</span></template></div><span v-if="isDemo" class="prototype-tag">界面原型 · 示例数据</span></header>
+   <header class="topbar"><div class="breadcrumb"><span class="workspace-crumb">工作空间</span><ChevronRight :size="14" /><button @click="section === 'web' ? goBack() : navigate(section)">{{sectionTitle}}</button><template v-if="section === 'web' && currentMonitor"><ChevronRight :size="14" /><span>{{currentMonitor.name}}</span></template></div><span v-if="isDemo" class="prototype-tag">界面原型 · 示例数据</span></header>
    <main>
+    <FleetView v-if="section !== 'web'" :key="section" :kind="section === 'vps' ? 'vps' : 'nodes'" />
+    <template v-else>
     <template v-if="!currentMonitor">
      <div class="page-heading"><div><div class="eyebrow">SERVICE MONITORING</div><h1 id="list-title" tabindex="-1">监控列表<span>{{monitors.length}}</span></h1><p>在一个地方，掌握每个服务的当前状态。</p></div><button class="button primary" @click="openForm()"><Plus :size="18" />新增监控</button></div>
      <section class="status-summary" aria-label="监控状态汇总"><div><span class="summary-label">监控总数</span><strong>{{summary.total}}<small>项服务</small></strong></div><div><span class="summary-label"><i class="status-dot up"></i>运行正常</span><strong>{{summary.up}}<small>UP</small></strong></div><div><span class="summary-label"><i class="status-dot down"></i>检测失败</span><strong>{{summary.down}}<small>DOWN</small></strong></div><div><span class="summary-label"><i class="status-dot unknown"></i>未检测 / 已停用</span><strong>{{summary.other}}<small>项服务</small></strong></div></section>
@@ -123,9 +131,10 @@ onMounted(() => {
       <div v-if="history.total && !historyLoading && !historyError" class="table-footer"><span>共 {{history.total}} 条记录 · 每页 {{history.size}} 条</span><div class="pagination"><button class="icon-button" aria-label="上一页" :disabled="history.page <= 1" @click="loadHistory(history.page - 1)"><ChevronLeft :size="17" /></button><span>{{history.page}} / {{historyPages}}</span><button class="icon-button" aria-label="下一页" :disabled="history.page >= historyPages" @click="loadHistory(history.page + 1)"><ChevronRight :size="17" /></button></div></div>
      </section>
     </template>
-    <div v-if="isDemo" class="demo-note"><CircleHelp :size="16" /><span>示例数据保存在当前浏览器。演示检测不请求实际地址，也不会在后台定时运行。</span></div>
+    </template>
+    <div v-if="isDemo" class="demo-note"><CircleHelp :size="16" /><span>示例数据仅保存在当前浏览器。演示不会请求实际地址、发送 Ping 或安装探针，也不在后台定时运行。</span></div>
    </main>
-   <footer class="app-footer"><span>xiaowork Watch</span><span>HTTP Monitor · v0.1</span></footer>
+   <footer class="app-footer"><span>xiaowork Watch</span><span>Website & VPS Monitor · v0.2 原型</span></footer>
   </div>
   <MonitorForm v-if="formState" :monitor="formState.monitor" :on-save="saveMonitor" @close="formState = null" />
   <dialog v-if="deleteTarget" ref="confirmDialog" class="confirm-dialog" aria-labelledby="delete-title" @cancel.prevent="closeDelete"><div class="delete-icon"><Trash2 :size="24" /></div><h2 id="delete-title">删除这个监控？</h2><p>将删除「{{deleteTarget.name}}」及其检测历史，此操作无法撤销。</p><p v-if="deleteError" class="inline-error" role="alert">{{deleteError}}</p><div class="dialog-footer"><button class="button" :disabled="deleting" autofocus @click="closeDelete">取消</button><button class="button danger" :disabled="deleting" @click="removeMonitor"><LoaderCircle v-if="deleting" :size="16" class="spin" />{{deleting ? '删除中…' : '确认删除'}}</button></div></dialog>

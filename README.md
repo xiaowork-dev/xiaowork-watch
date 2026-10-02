@@ -1,12 +1,18 @@
 # xiaowork Watch
 
-面向个人开发者的 HTTP/HTTPS 服务监控平台。本次交付为 v0.1 **可交互的前端原型**，采用 Vue 3 + Vite + Axios；实际后端仍按开发文档规划使用 Java 21 + Spring Boot + MySQL 8 + MyBatis-Plus。
+面向个人开发者的 网站与 VPS 监控平台。本次交付为 v0.2 **可交互的前端原型**，采用 Vue 3 + Vite + Axios；实际后端仍按开发文档规划使用 Java 21 + Spring Boot + MySQL 8 + MyBatis-Plus。
 
 ## 原型范围
 
-监控列表、创建/编辑表单、启用/停用、删除确认、演示检测、监控详情、倒序分页历史记录。未实现后端检测器、后台调度、数据库和身份验证。
+网站监控列表、创建/编辑表单、启用/停用、删除确认、演示检测、详情与分页历史。新增 VPS 管理、自定义测试节点、节点到 VPS 的延迟与丢包视图，以及 Ubuntu/Debian 安装引导。未实现后端检测器、后台调度、数据库、身份验证或真实 Linux 探针。
 
-所有默认服务使用保留的 `.example` 域名。原型不会请求这些域名。检测结果为固定演示情境，本地修改仅保存在当前浏览器；不代表线上服务状态。停用是独立的 enabled 配置，不改变最近一次 UP/DOWN/UNKNOWN 检测结果。
+默认网站使用保留的 `.example` 域名，默认 VPS 使用文档示例 IP。原型不会请求这些地址或发送 Ping。检测结果为固定演示情境，本地修改仅保存在当前浏览器；不代表线上服务状态。停用是独立的 enabled 配置，不改变最近一次 UP/DOWN/UNKNOWN 检测结果。
+
+## VPS 与测试节点
+
+网站是主控，VPS 探针上报心跳，测试节点向选定的 VPS 测量 ICMP 延迟与丢包。探针在线状态和线路测量结果分别显示，不把节点离线当成 VPS 故障。
+
+安装区目前只有全部注释的命令模板；复制模板不会安装服务或注册探针。独立的“演示注册上线”按钮只更新本地示例数据。真实安装需要部署主控后端与 Linux 探针。详细实施约定见 [VPS 与节点设计](docs/design/vps-v0.2.md)。
 
 ## 本地启动
 
@@ -26,7 +32,8 @@ src/App.vue              页面与交互
 src/style.css            浅色界面、响应式布局
 src/components/          表单和状态徽标
 src/api/monitors.js       Axios API 适配器
-src/api/demo.js           仅限原型的本地数据适配器
+src/api/demo.js           网站本地示例适配器
+src/api/fleet.js          VPS/测试节点数据适配器
 docs/design/             设计范围与交接约定
 docs/requirements/       原始开发文档
 ```
@@ -35,4 +42,4 @@ docs/requirements/       原始开发文档
 
 `VITE_DATA_MODE=api` 选择真实 API 适配器；原型默认 demo。此开关只选择数据层，**不会创建后端**。开发代理将 `/api` 转发至 `127.0.0.1:8080`；生产需配置同域反向代理或设置 `VITE_API_BASE_URL`。`VITE_` 变量会进入公开前端包，不应存放秘密。
 
-分页与 JSON 命名暂按 `docs/design/ui-v0.1.md` 中的草案约定。真实后端尚未运行或验收，当前不应将原型用作生产监控系统。
+分页与 JSON 命名暂按 `docs/design/ui-v0.1.md` 和 `docs/design/vps-v0.2.md` 中的草案约定。真实后端尚未运行或验收，当前不应将原型用作生产监控系统。
