@@ -105,9 +105,9 @@ class NginxFixture:
             self.token = "fixture-token"
             (self.challenge / self.token).write_text("offline-acme-token", encoding="ascii")
             archive = self.folders["certs"] / "archive" / console.TLS_NAME
-            live = self.folders["certs"] / "live" / console.TLS_NAME
+            cert_live = self.folders["certs"] / "live" / console.TLS_NAME
             archive.mkdir(parents=True)
-            live.mkdir(parents=True)
+            cert_live.mkdir(parents=True)
             self.certificate = archive / "fullchain1.pem"
             self.key = archive / "privkey1.pem"
             openssl_config = self.base / "openssl.cnf"
@@ -126,7 +126,7 @@ class NginxFixture:
                 target = archive / (name + "1.pem")
                 if not target.exists():
                     shutil.copyfile(str(self.certificate), str(target))
-                (live / (name + ".pem")).symlink_to(Path("../../archive") / console.TLS_NAME / target.name)
+                (cert_live / (name + ".pem")).symlink_to(Path("../../archive") / console.TLS_NAME / target.name)
             self.context = ssl.create_default_context(cafile=str(self.certificate))
             self.backend = ThreadingHTTPServer(("127.0.0.1", 0), Backend)
             self.backend.daemon_threads = True
