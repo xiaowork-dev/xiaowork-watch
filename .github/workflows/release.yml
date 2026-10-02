@@ -1,0 +1,47 @@
+name: Build and publish frontend
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: frontend-release-main
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Install dependencies
+        run: npm ci
+      - name: Test installer and updater
+        run: |
+          bash -n install.sh
+          python3 -m unittest discover -s tests -p 'test_deploy*.py' -v
+      - name: Build frontend prototype
+        run: npm run build
+      - name: Package verified build
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: python3 scripts/deploy/package_release.py --commit "$SOURCE_SHA"
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/deploy/publish_release.py release-assets/xiaowork-watch-web.tar.gz release-assets/xiaowork-watch-web.tar.gz.sha256
