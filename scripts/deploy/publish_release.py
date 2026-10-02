@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Publish a validated static Web package from the current GitHub main commit."""
+"""Publish a validated application package from the current GitHub main commit."""
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import sys
+import tarfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -42,6 +43,81 @@ class Artifact:
     size: int
     sha256: str
     content_type: str
+    label: str = ""
+
+
+@dataclass(frozen=True)
+class ReleaseInfo:
+    version: str
+    kind: str
+    commit: str
+
+
+def validate_release_info(info: ReleaseInfo, sha: str) -> None:
+    version_pattern = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    if (not isinstance(info, ReleaseInfo) or not isinstance(info.version, str)
+            or len(info.version) > 100 or not re.fullmatch(version_pattern, info.version)
+            or info.kind not in ("frontend-prototype", "monitoring-server")
+            or info.commit != sha or not re.fullmatch(r"[0-9a-f]{40}", str(info.commit))):
+        raise PublishError("Package release.json has an invalid version, kind or source commit.")
+
+
+def _unique_json_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise PublishError("Package release.json contains duplicate JSON keys.")
+        result[key] = value
+    return result
+
+
+def read_release_info(package: Path, sha: str) -> ReleaseInfo:
+    """Read the actual packaged metadata without extracting any archive files."""
+    metadata = None
+    found = False
+    try:
+        with package.open("rb") as stream, tarfile.open(fileobj=stream, mode="r:gz") as archive:
+            for index, member in enumerate(archive):
+                if index >= 100000:
+                    raise PublishError("Package archive contains too many entries.")
+                if member.name != "release.json":
+                    continue
+                if found or not member.isfile() or member.size < 1 or member.size > 65536:
+                    raise PublishError("Package must contain one regular, bounded release.json file.")
+                found = True
+                with archive.extractfile(member) as source:
+                    metadata = json.loads(source.read(65537).decode("utf-8"), object_pairs_hook=_unique_json_keys)
+    except (tarfile.TarError, EOFError, ValueError, UnicodeError):
+        raise PublishError("Package release.json or its archive is malformed.") from None
+    if not isinstance(metadata, dict) or type(metadata.get("schema")) is not int or metadata["schema"] != 1:
+        raise PublishError("Package release.json has an unsupported or missing schema.")
+    info = ReleaseInfo(metadata.get("version"), metadata.get("kind"), metadata.get("commit"))
+    validate_release_info(info, sha)
+    return info
+
+
+def release_presentation(info: ReleaseInfo, changelog: str = "") -> dict[str, str]:
+    """Human-readable metadata; internal tags and asset names stay compatible."""
+    validate_release_info(info, info.commit)
+    kind = "监控系统" if info.kind == "monitoring-server" else "前端原型"
+    title = "xiaowork Watch v" + info.version + "（" + kind + "）"
+    version = re.escape(info.version)
+    section = re.search(r"^## (?:v)?" + version + r"(?:-prototype)?(?:[ \t]+[^\n]*)?\n(.*?)(?=^## |\Z)", changelog, re.MULTILINE | re.DOTALL)
+    notes = section.group(1).strip() if section else ""
+    description = ("包含网站监控主控、公开只读页面、管理员后台和 Linux VPS 探针。"
+                   if info.kind == "monitoring-server" else "仅包含交互式前端原型，尚未接入真实监控后端或 VPS 探针。")
+    body = "版本：`v" + info.version + "` · 类型：" + kind + "\n\n" + description
+    if notes:
+        body += "\n\n### 本版本变更\n\n" + notes
+    body += ("\n\n### 下载说明\n\n"
+             "- `" + PACKAGE_NAME + "`：v" + info.version + " 完整安装包。\n"
+             "- `" + CHECKSUM_NAME + "`：该安装包的 SHA-256 校验文件。\n\n"
+             "自动更新使用固定资产文件名；GitHub 显示标签注明所属版本。\n\n源代码提交：`" + info.commit + "`。")
+    return {"name": title, "body": body}
+
+
+def labeled_artifacts(artifacts: tuple[Artifact, Artifact], info: ReleaseInfo) -> tuple[Artifact, Artifact]:
+    return tuple(replace(artifact, label="v" + info.version + " · " + ("完整安装包" if artifact.name == PACKAGE_NAME else "SHA-256 校验文件")) for artifact in artifacts)
 
 
 def checksum_from_text(text: str) -> str:
@@ -147,7 +223,10 @@ class GitHub:
         parsed = urllib.parse.urlsplit(base)
         if parsed.scheme != "https" or parsed.netloc != "uploads.github.com" or not re.fullmatch(r"/repos/[^/]+/[^/]+/releases/[0-9]+/assets", parsed.path) or parsed.query or parsed.fragment:
             raise PublishError("GitHub supplied an unexpected asset upload URL.")
-        url = base + "?" + urllib.parse.urlencode({"name": artifact.name})
+        parameters = {"name": artifact.name}
+        if artifact.label:
+            parameters["label"] = artifact.label
+        url = base + "?" + urllib.parse.urlencode(parameters)
         try:
             with artifact.path.open("rb") as stream:
                 request = self._request("POST", url, data=stream, content_type=artifact.content_type, content_length=artifact.size)
@@ -272,7 +351,7 @@ def asset_matches(api: GitHub, asset: dict, artifact: Artifact) -> bool:
     return size == artifact.size and digest == artifact.sha256
 
 
-def ensure_assets(api: GitHub, release: dict, artifacts: tuple[Artifact, Artifact]) -> None:
+def ensure_assets(api: GitHub, release: dict, artifacts: tuple[Artifact, Artifact]) -> list[dict]:
     existing = list_assets(api, release["id"])
     # Validate all published assets before any mutation. Published assets are
     # immutable here, even when the repository has not enabled immutable releases.
@@ -281,8 +360,8 @@ def ensure_assets(api: GitHub, release: dict, artifacts: tuple[Artifact, Artifac
             asset = matching_asset(existing, artifact)
             if asset is None or not asset_matches(api, asset, artifact):
                 raise PublishError("Published release asset is missing or differs: " + artifact.name + ". Refusing to overwrite it.")
-        print("Verified existing published release assets; no assets were modified.")
-        return
+        print("Verified existing published release asset bytes; no assets were replaced.")
+        return existing
     for artifact in artifacts:
         asset = matching_asset(existing, artifact)
         if asset is not None and asset_matches(api, asset, artifact):
@@ -302,9 +381,27 @@ def ensure_assets(api: GitHub, release: dict, artifacts: tuple[Artifact, Artifac
         asset = matching_asset(final_assets, artifact)
         if asset is None or not asset_matches(api, asset, artifact):
             raise PublishError("Final release asset verification failed: " + artifact.name + ".")
+    return final_assets
 
 
-def publish(api: GitHub, sha: str, artifacts: tuple[Artifact, Artifact]) -> bool:
+def sync_asset_labels(api: GitHub, assets: list[dict], artifacts: tuple[Artifact, Artifact]) -> None:
+    pending = []
+    for artifact in artifacts:
+        asset = matching_asset(assets, artifact)
+        if asset is None or type(asset.get("id")) is not int:
+            raise PublishError("Verified asset has an invalid identifier.")
+        if asset.get("label") != artifact.label:
+            pending.append((asset, artifact.label))
+    for asset, label in pending:
+        result = api.json("PATCH", "/releases/assets/" + str(asset["id"]), {"label": label})
+        if not isinstance(result, dict) or result.get("name") != asset["name"] or result.get("label") != label:
+            raise PublishError("GitHub did not confirm the requested asset display label.")
+
+
+def publish(api: GitHub, sha: str, artifacts: tuple[Artifact, Artifact], info: ReleaseInfo, *, changelog: str = "") -> bool:
+    validate_release_info(info, sha)
+    presentation = release_presentation(info, changelog)
+    artifacts = labeled_artifacts(artifacts, info)
     if not current_main(api, sha):
         return False
     tag = "web-" + sha
@@ -315,32 +412,47 @@ def publish(api: GitHub, sha: str, artifacts: tuple[Artifact, Artifact]) -> bool
         release = api.json("POST", "/releases", {
             "tag_name": tag,
             "target_commitish": sha,
-            "name": "Web prototype " + sha[:12],
-            "body": "Static Web prototype package. This release does not include a monitoring backend or a Linux probe.",
+            **presentation,
             "draft": True,
             "prerelease": False,
             "make_latest": "false",
         })
         print("Created unpublished draft release: " + tag)
     validate_release(api, release, tag, sha)
-    ensure_assets(api, release, artifacts)
+    assets = ensure_assets(api, release, artifacts)
     if not current_main(api, sha):
         return False
+    already_latest = False
     if not release["draft"]:
         latest = api.json("GET", "/releases/latest", missing_ok=True)
         if isinstance(latest, dict) and latest.get("tag_name") == tag:
-            print("Verified release is already latest: " + tag)
-            return True
+            already_latest = True
         # The lookup above is an additional network round trip, so recheck main.
         if not current_main(api, sha):
             return False
-    result = api.json("PATCH", "/releases/" + str(release["id"]), {"draft": False, "make_latest": "true"})
-    if not isinstance(result, dict) or result.get("tag_name") != tag or result.get("draft") is not False or result.get("prerelease") is not False:
+    sync_asset_labels(api, assets, artifacts)
+    # Label updates add network round trips; a newer main must never be replaced
+    # by this older draft or have its latest release status changed afterward.
+    if not current_main(api, sha):
+        return False
+    payload = {key: value for key, value in presentation.items() if release.get(key) != value}
+    if already_latest:
+        if payload:
+            result = api.json("PATCH", "/releases/" + str(release["id"]), payload)
+            if not isinstance(result, dict) or any(result.get(key) != value for key, value in payload.items()):
+                raise PublishError("GitHub did not confirm the requested release display metadata.")
+        print("Verified release display and assets are already latest: " + tag)
+        return True
+    payload.update({"draft": False, "make_latest": "true"})
+    result = api.json("PATCH", "/releases/" + str(release["id"]), payload)
+    if (not isinstance(result, dict) or result.get("tag_name") != tag
+            or result.get("draft") is not False or result.get("prerelease") is not False
+            or any(result.get(key) != value for key, value in presentation.items())):
         raise PublishError("GitHub did not confirm the requested published release state.")
     latest = api.json("GET", "/releases/latest")
     if not isinstance(latest, dict) or latest.get("tag_name") != tag:
         raise PublishError("Release was published, but GitHub did not confirm it as latest.")
-    print("Published validated Web prototype release as latest: " + tag)
+    print("Published validated " + info.kind + " v" + info.version + " as latest: " + tag)
     return True
 
 
@@ -363,12 +475,15 @@ def main(argv=None) -> int:
         if not current_main(api, sha):
             return 0
         artifacts = prepare_artifacts(args.package, args.checksum)
-        publish(api, sha, artifacts)
+        info = read_release_info(args.package, sha)
+        changelog_path = Path(__file__).resolve().parents[2] / "CHANGELOG.md"
+        changelog = changelog_path.read_text(encoding="utf-8") if changelog_path.is_file() else ""
+        publish(api, sha, artifacts, info, changelog=changelog)
         return 0
     except PublishError as exc:
         print("Release publication failed: " + str(exc), file=sys.stderr)
         return 1
-    except OSError:
+    except (OSError, UnicodeError):
         print("Release publication failed: unable to read a local artifact or complete network I/O.", file=sys.stderr)
         return 1
 

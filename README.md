@@ -68,3 +68,5 @@ npm run build
 ## 代码
 
 `src/` 为公开页面和管理界面，`backend/` 为真实检测、调度、权限和数据库，`agent/` 为 Linux 探针及安装器，`scripts/deploy/` 为校验、更新、HTTPS 和卸载。实用版的接口与部署约定见 [v0.4 测速设计](docs/design/latency-v0.4.md)。
+
+GitHub [历史版本](https://github.com/xiaowork-dev/xiaowork-watch/releases) 使用 `xiaowork Watch v版本号` 标题，安装包和 SHA-256 校验文件的显示标签也包含对应版本；每版附中文更新说明，旧前端原型明确标注。服务器自动更新使用的下载地址保持兼容。

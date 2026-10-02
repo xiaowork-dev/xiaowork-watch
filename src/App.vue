@@ -114,7 +114,7 @@ onUnmounted(() => { alive = false; ++listRequest; ++historyRequest; unsubscribe?
    <a :class="['nav-item',{active:section === 'web'}]" :href="link('web')" :aria-current="section === 'web' ? 'page' : undefined" @click.prevent="navigate('web')"><Radio :size="18" />网站监控<span class="nav-count">{{monitors.length}}</span></a>
    <a :class="['nav-item',{active:section === 'vps'}]" :href="link('vps')" :aria-current="section === 'vps' ? 'page' : undefined" @click.prevent="navigate('vps')"><Server :size="18" />VPS 监控</a>
    <a :class="['nav-item',{active:section === 'nodes'}]" :href="link('nodes')" :aria-current="section === 'nodes' ? 'page' : undefined" @click.prevent="navigate('nodes')"><Network :size="18" />测速目标</a>
-   <div class="sidebar-bottom"><div class="version"><span>当前版本</span><b>v0.4.2</b></div><p>网站 · VPS · 测速目标</p><div class="account"><span class="avatar">X</span><div><b>{{canManage ? '管理员后台' : '公开状态页'}}</b><small>{{canManage ? session.username : '公开只读'}}</small></div></div></div>
+   <div class="sidebar-bottom"><div class="version"><span>当前版本</span><b>v0.4.3</b></div><p>网站 · VPS · 测速目标</p><div class="account"><span class="avatar">X</span><div><b>{{canManage ? '管理员后台' : '公开状态页'}}</b><small>{{canManage ? session.username : '公开只读'}}</small></div></div></div>
   </aside>
   <div class="main-shell">
    <header class="topbar"><div class="breadcrumb"><span class="workspace-crumb">工作空间</span><ChevronRight :size="14" /><button @click="section === 'web' ? goBack() : navigate(section)">{{sectionTitle}}</button><template v-if="section === 'web' && currentMonitor"><ChevronRight :size="14" /><span>{{currentMonitor.name}}</span></template></div><div class="session-actions"><span class="access-badge">{{canManage ? '管理员' : '公开只读'}}</span><template v-if="canManage"><button class="button subtle" @click="publicPage">公开页</button><button class="button subtle" :disabled="logoutBusy" @click="logout"><LogOut :size="15" />退出登录</button></template><button v-else-if="!route.admin" class="button subtle" @click="enterAdmin"><LogIn :size="15" />进入后台</button><button v-else class="button subtle" @click="publicPage">返回公开页</button></div></header>
@@ -151,7 +151,7 @@ onUnmounted(() => { alive = false; ++listRequest; ++historyRequest; unsubscribe?
     </template>
     <p v-if="!loginRequired" class="fleet-context"><CircleHelp :size="16" />每 15 秒刷新已有数据；刷新不会发起检测。{{canManage ? '管理操作由服务器校验登录权限。' : '当前为公开只读页面。'}}</p>
    </main>
-   <footer class="app-footer"><span>xiaowork Watch</span><span>Website & VPS Monitor · v0.4.2</span></footer>
+   <footer class="app-footer"><span>xiaowork Watch</span><span>Website & VPS Monitor · v0.4.3</span></footer>
   </div>
   <MonitorForm v-if="canManage && formState" :monitor="formState.monitor" :on-save="saveMonitor" @close="formState = null" />
   <dialog v-if="canManage && deleteTarget" ref="confirmDialog" class="confirm-dialog" aria-labelledby="delete-title" @cancel.prevent="closeDelete"><div class="delete-icon"><Trash2 :size="24" /></div><h2 id="delete-title">删除这个监控？</h2><p>将删除「{{deleteTarget.name}}」及其检测历史，此操作无法撤销。</p><p v-if="deleteError" class="inline-error" role="alert">{{deleteError}}</p><div class="dialog-footer"><button class="button" :disabled="deleting" autofocus @click="closeDelete">取消</button><button class="button danger" :disabled="deleting" @click="removeMonitor"><LoaderCircle v-if="deleting" :size="16" class="spin" />{{deleting ? '删除中…' : '确认删除'}}</button></div></dialog>
