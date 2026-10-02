@@ -25,3 +25,6 @@
 @media(max-width:600px){.topbar{height:auto;min-height:64px;gap:10px;flex-wrap:wrap;padding-top:12px;padding-bottom:12px}.session-actions{gap:5px;flex-wrap:wrap}.session-actions .button{font-size:12px;padding:7px 9px}.access-badge{font-size:11px}.login-panel{margin:10px auto 30px;padding:24px}.sidebar .nav-item{font-size:13px;padding:8px 9px}.app-footer{gap:10px}}
 
 .install-mode{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0}.install-mode .button.primary{margin:0;padding:9px 14px}.fleet-results .monitor-url{white-space:normal;overflow-wrap:anywhere;max-width:320px}.fleet-view>.installation-notice{margin-bottom:24px}.status-summary .field-error{color:#c94e64}
+
+/* Page headings receive programmatic focus after navigation; keep control focus indicators. */
+.page-heading h1[tabindex="-1"]:focus{outline:none}
