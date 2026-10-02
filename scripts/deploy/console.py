@@ -39,6 +39,7 @@ class Paths:
     nginx_site: Path = Path("/etc/nginx/conf.d/xiaowork-watch.conf")
     nginx_proxy: Path = Path("/etc/nginx/conf.d/xiaowork-watch-proxy.conf")
     wrapper: Path = Path("/usr/local/bin/xiaowork-watch")
+    shortcut: Path = Path("/usr/local/bin/xw")
     service: Path = Path("/etc/systemd/system/xiaowork-watch-update.service")
     timer: Path = Path("/etc/systemd/system/xiaowork-watch-update.timer")
     tls_service: Path = Path("/etc/systemd/system/" + TLS_SERVICE)
@@ -169,6 +170,48 @@ def _header(manager):
     return OWNER + "\n" + ROOT_PREFIX + _root_text(manager) + "\n"
 
 
+def _shortcut_text(manager):
+    return '#!/bin/sh\n' + _header(manager) + 'exec /usr/local/bin/xiaowork-watch "$@"\n'
+
+
+def _create_shortcut(path, text):
+    """Publish a new command only if its name is still unused."""
+    path = Path(path)
+    descriptor, temporary = tempfile.mkstemp(prefix=".xiaowork-watch-", dir=str(path.parent))
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as output:
+            output.write(text)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary, 0o755)
+        # Linking within the directory atomically reserves the destination;
+        # another program's intervening file or symlink must never be replaced.
+        os.link(temporary, str(path))
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _sync_shortcut(manager, paths):
+    """Repair our optional short command without disturbing another program."""
+    try:
+        if not _owned(paths.wrapper, manager, "wrapper", paths):
+            return False
+        shortcut = paths.shortcut
+        present = shortcut.exists() or shortcut.is_symlink()
+        if present and not _owned(shortcut, manager, "shortcut", paths):
+            raise ConsoleError("该文件不属于此安装，已保留：" + str(shortcut))
+        text = _shortcut_text(manager)
+        if not present:
+            _create_shortcut(shortcut, text)
+        elif (_read_regular(shortcut) != text or stat.S_IMODE(shortcut.stat().st_mode) != 0o755):
+            _write(shortcut, text, 0o755)
+        return True
+    except (OSError, UnicodeError, ConsoleError) as error:
+        print("短命令 xw 未启用；仍可使用 sudo xiaowork-watch。" + str(error), file=sys.stderr)
+        return False
+
+
 def _domain(value):
     if not isinstance(value, str) or len(value) > 253 or not value:
         raise ConsoleError("请输入有效域名，例如 watch.example.com。")
@@ -184,6 +227,8 @@ def _owned(path, manager, kind, paths=DEFAULT_PATHS):
     if not path.exists() and not path.is_symlink():
         return False
     text = _read_regular(path).replace("\r\n", "\n")
+    if kind == "shortcut":
+        return text == _shortcut_text(manager)
     lines = text.splitlines()
     root_lines = [line for line in lines if line.startswith(ROOT_PREFIX)]
     if root_lines:
@@ -280,6 +325,8 @@ def ensure_control_entry(manager, paths=DEFAULT_PATHS, locked=None, refresh=Fals
         finally:
             if temporary.is_symlink():
                 temporary.unlink()
+        if previous_wrapper is not None:
+            _sync_shortcut(manager, paths)
         return True
 
 
@@ -919,6 +966,13 @@ def uninstall(manager, confirm=False, paths=DEFAULT_PATHS, locked=None, purge=Fa
                         (paths.backend_service, "backend-service")]
         for path, kind in global_paths:
             _require_owned(path, manager, kind, paths)
+        # The optional shortcut can be another program or another install's
+        # entry. Keep it without preventing this deployment's removal.
+        try:
+            if _owned(paths.shortcut, manager, "shortcut", paths):
+                global_paths.append((paths.shortcut, "shortcut"))
+        except (OSError, UnicodeError, ConsoleError):
+            pass
         internal = _internal_uninstall_targets(manager)
         snapshots = {path: (_read_regular(path), stat.S_IMODE(path.stat().st_mode))
                      for path, _ in global_paths if path.exists()}
@@ -955,7 +1009,7 @@ def uninstall(manager, confirm=False, paths=DEFAULT_PATHS, locked=None, purge=Fa
                 _run(["nginx", "-t"])
                 if nginx_active:
                     _run(["systemctl", "reload", "nginx"])
-            for path in (paths.service, paths.timer, paths.tls_service, paths.tls_timer, paths.backend_service, paths.wrapper):
+            for path in (paths.service, paths.timer, paths.tls_service, paths.tls_timer, paths.backend_service, paths.wrapper, paths.shortcut):
                 if path in snapshots:
                     path.unlink()
                     removed.append(path)
@@ -1079,7 +1133,14 @@ def run_menu(manager, locked, paths=DEFAULT_PATHS):
         return 1
     with terminal:
         while True:
-            _say(terminal, "\n========== xiaowork Watch ==========\n服务器管理\n\n  1. 查看状态\n  2. 配置域名 HTTP 反代\n  3. 更新网站\n  4. 回退上一版本\n  5. 自动更新开关\n  6. 查看更新日志\n  7. 彻底卸载 xiaowork Watch\n  8. 配置 HTTPS\n  9. 重置管理员密码\n  0. 退出\n")
+            try:
+                shortcut_available = _owned(paths.shortcut, manager, "shortcut", paths)
+            except (OSError, UnicodeError, ConsoleError):
+                shortcut_available = False
+            entry = "sudo xw" if shortcut_available else "sudo xiaowork-watch"
+            _say(terminal, "\n========== xiaowork Watch ==========\n服务器管理\n菜单入口：" + entry
+                 + "\n安装目录：" + str(manager.root)
+                 + "\n\n  1. 查看状态\n  2. 配置域名 HTTP 反代\n  3. 更新网站\n  4. 回退上一版本\n  5. 自动更新开关\n  6. 查看更新日志\n  7. 彻底卸载 xiaowork Watch\n  8. 配置 HTTPS\n  9. 重置管理员密码\n  0. 退出\n")
             choice = _ask(terminal, "请选择：")
             if choice in (None, "0"):
                 return 0

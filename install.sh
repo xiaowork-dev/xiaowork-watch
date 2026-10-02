@@ -14,6 +14,7 @@ usage() {
  cat <<'HELP'
 用法：sudo bash install.sh [--port 8088] [--domain watch.example.com] [--path /opt/xiaowork-watch]
 默认打开中文菜单：首次部署/卸载，安装后打开管理菜单。
+安装后输入 sudo xw 打开菜单；sudo xiaowork-watch 仍可使用。
 --install / --non-interactive 直接部署或更新，不打开菜单。
 --uninstall  卸载服务入口；加 --purge 清理本项目历史包、配置和证书。
 --confirm    无交互终端时显式确认卸载；菜单卸载默认包含本项目数据。
@@ -68,6 +69,7 @@ elif [[ -d "$deploy_root" && -n "$(find "$deploy_root" -mindepth 1 -maxdepth 1 -
 fi
 nginx_config=/etc/nginx/conf.d/xiaowork-watch.conf
 wrapper=/usr/local/bin/xiaowork-watch
+shortcut=/usr/local/bin/xw
 service=/etc/systemd/system/xiaowork-watch-update.service
 timer=/etc/systemd/system/xiaowork-watch-update.timer
 open_menu_terminal() {
@@ -207,6 +209,8 @@ install_temp=$(mktemp -d /tmp/xiaowork-watch-install.XXXXXXXX)
 install_success=false
 nginx_written=false
 wrapper_written=false
+shortcut_written=false
+shortcut_temp=''
 service_written=false
 timer_written=false
 cleanup() {
@@ -220,6 +224,7 @@ cleanup() {
   fi
   [[ "$service_written" != true || -L "$service" ]] || rm -f -- "$service"
   [[ "$wrapper_written" != true || -L "$wrapper" ]] || rm -f -- "$wrapper"
+  [[ "$shortcut_written" != true || -L "$shortcut" ]] || rm -f -- "$shortcut"
   if [[ "$nginx_written" == true && ! -L "$nginx_config" ]]; then
    rm -f -- "$nginx_config"
    nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
@@ -228,6 +233,7 @@ cleanup() {
   echo 'Installation failed. Configuration created by this run was removed; downloaded files remain for retry.' >&2
  fi
  case "$install_temp" in /tmp/xiaowork-watch-install.*) [[ -d "$install_temp" && ! -L "$install_temp" ]] && rm -rf -- "$install_temp";; esac
+ case "$shortcut_temp" in /usr/local/bin/.xiaowork-watch-shortcut.*) [[ -f "$shortcut_temp" && ! -L "$shortcut_temp" ]] && rm -f -- "$shortcut_temp";; esac
  exit "$result"
 }
 trap cleanup EXIT
@@ -287,6 +293,25 @@ cat > "$wrapper" <<WRAPPER
 exec /usr/bin/python3 "$deploy_root/control/manage.py" --root "$deploy_root" "\$@"
 WRAPPER
 chmod 755 "$wrapper"
+if [[ ! -e "$shortcut" && ! -L "$shortcut" ]]; then
+ shortcut_temp=$(mktemp /usr/local/bin/.xiaowork-watch-shortcut.XXXXXXXX)
+ cat > "$shortcut_temp" <<SHORTCUT
+#!/bin/sh
+# Managed by xiaowork Watch's frontend installer.
+# xiaowork-watch-root: $deploy_root
+exec /usr/local/bin/xiaowork-watch "\$@"
+SHORTCUT
+ chmod 755 "$shortcut_temp"
+ if ln -T -- "$shortcut_temp" "$shortcut" 2>/dev/null; then
+  shortcut_written=true
+ else
+  printf '短命令 xw 已被其他程序占用，保留原命令 sudo xiaowork-watch。\n' >&2
+ fi
+ rm -f -- "$shortcut_temp"
+ shortcut_temp=''
+else
+ printf '短命令 xw 已被其他程序占用，保留原命令 sudo xiaowork-watch。\n' >&2
+fi
 [[ ! -e "$service" && ! -L "$service" ]] || { echo 'Service path became occupied.' >&2; exit 1; }
 service_written=true
 cat > "$service" <<SERVICE
@@ -327,6 +352,7 @@ install_success=true
 printf '\n真实监控部署完成，端口 %s。公开页为 /，管理员后台为 /admin。\n' "$listen_port"
 printf '管理员用户名 admin，初始随机密码见上方输出；忘记密码运行 sudo xiaowork-watch reset-admin。\n'
 printf '访问 http://服务器IP:%s/ ，如有防火墙或云安全组请开放此端口。\n' "$listen_port"
+if [[ "$shortcut_written" == true ]]; then printf '管理菜单短命令：sudo xw\n'; fi
 printf '管理菜单：sudo xiaowork-watch\n命令：sudo xiaowork-watch update | rollback | status\n'
 printf '约每15分钟检查 GitHub 更新；手动回退会暂停自动更新。\n'
 if [[ "$show_after_install" == true ]]; then run_management menu; fi

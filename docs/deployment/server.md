@@ -1,4 +1,4 @@
-# 服务器部署与更新（v0.4.0）
+# 服务器部署与更新（v0.4.1）
 
 本版本包含真实网站检测、SQLite 存储、管理员登录和 Linux VPS 的 ICMP / TCP 测速探针。公开页 `/` 只读，后台 `/admin` 登录后可修改。原型中的浏览器数据仍保留，但不会自动导入真实数据库。
 
@@ -25,13 +25,15 @@ sudo xiaowork-watch reset-admin
 ## 管理菜单
 
 ```bash
-sudo xiaowork-watch
+sudo xw
 sudo xiaowork-watch status
 sudo xiaowork-watch update
 sudo xiaowork-watch auto-update off
 sudo xiaowork-watch auto-update on
 sudo xiaowork-watch rollback
 ```
+
+`sudo xw` 是固定的管理菜单入口，支持 `sudo xw status`、`sudo xw update` 等同样的子命令；原命令 `sudo xiaowork-watch` 仍然可用。已有安装先执行 `sudo xiaowork-watch update`，再执行一次 `sudo xiaowork-watch status` 补齐短命令；等待自动更新到 v0.4.1 后也可执行一次原命令来补齐，不需要重新安装。若同名 `xw` 属于其他程序，会保留该程序并提示使用原命令；卸载也不会删除其他程序的短命令。
 
 main 推送通过检查后发布，服务器约每 15 分钟查询一次最新完整发布包。更新校验 SHA256、提交与包类型，停止旧主控后原子切换前后端并重启。短暂升级期间修改请求返回 503，后台调度暂停；健康检查和安装记录完成后才恢复写入。网站或主控健康检查失败会恢复原版、配置及跨数据结构升级前的数据库，避免已确认的写入被回滚。SQLite 位于 `shared/data`，更新保留监控、历史、账号和探针凭据。
 

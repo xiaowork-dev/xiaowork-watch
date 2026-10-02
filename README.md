@@ -27,7 +27,7 @@ sudo xiaowork-watch reset-admin
 
 也可用管理菜单 **9. 重置管理员密码**，重置后原登录会话失效。没有公开注册或共享默认密码。
 
-安装后 `sudo xiaowork-watch` 打开管理菜单，保留反代、HTTPS、更新、回退、自动更新、日志和彻底卸载。默认网站端口 8088，主控仅在 `127.0.0.1:8091` 监听。main 推送后发布完整前后端包，服务器约每 15 分钟检查更新。详细步骤和手动源码部署见 [服务器部署说明](docs/deployment/server.md)。
+安装后 `sudo xw` 打开管理菜单，原命令 `sudo xiaowork-watch` 继续可用。菜单提供反代、HTTPS、更新、回退、自动更新、日志和彻底卸载。已有安装先执行 `sudo xiaowork-watch update`，再执行一次 `sudo xiaowork-watch status` 补齐短命令；自动更新到 v0.4.1 后也可执行一次原命令来补齐，无需重新安装。若 `xw` 已被其他程序占用，会保留该程序并提示使用原命令。默认网站端口 8088，主控仅在 `127.0.0.1:8091` 监听。main 推送后发布完整前后端包，服务器约每 15 分钟检查更新。详细步骤和手动源码部署见 [服务器部署说明](docs/deployment/server.md)。
 
 ## VPS / 测速目标
 

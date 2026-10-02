@@ -90,6 +90,7 @@ class UninstallTests(unittest.TestCase):
             (self.root / "control").symlink_to(Path("releases") / SHA / ".deploy")
         for field in fields(console.Paths):
             getattr(self.paths, field.name).write_text(console._header(self.manager) + "owned fixture\n", encoding="utf-8")
+        self.paths.shortcut.write_text(console._shortcut_text(self.manager), encoding="utf-8")
         self.foreign = self.system / "other-site.conf"
         self.foreign.write_text("unrelated site", encoding="utf-8")
 

@@ -73,7 +73,7 @@ class ConsoleTests(unittest.TestCase):
         state_query.start()
         self.addCleanup(state_query.stop)
         self.paths = console.Paths(**{name: self.system / name for name in (
-            "nginx_site", "nginx_proxy", "wrapper", "service", "timer", "tls_service", "tls_timer")})
+            "nginx_site", "nginx_proxy", "wrapper", "shortcut", "service", "timer", "tls_service", "tls_timer", "backend_service")})
         self.locked_paths = []
         self.inside_lock = False
         self.write_config()
@@ -108,6 +108,7 @@ class ConsoleTests(unittest.TestCase):
         for path, text in ((self.paths.nginx_site, site), (self.paths.wrapper, wrapper),
                            (self.paths.service, console.OLD_SERVICE), (self.paths.timer, console.OLD_TIMER)):
             path.write_text(console._header(self.manager) + text, encoding="utf-8")
+        self.paths.shortcut.write_text(console._shortcut_text(self.manager), encoding="utf-8")
 
     def proxy(self, domain="watch.example.com"):
         return console.configure_proxy(self.manager, domain, paths=self.paths, locked=self.locked)
@@ -230,7 +231,7 @@ class ConsoleTests(unittest.TestCase):
         with patch.object(console, "_run", return_value="") as commands:
             result = console.uninstall(self.manager, True, paths=self.paths, locked=self.locked)
         self.assertEqual(result["status"], "uninstalled")
-        for path in (self.paths.nginx_site, self.paths.wrapper, self.paths.service, self.paths.timer,
+        for path in (self.paths.nginx_site, self.paths.wrapper, self.paths.shortcut, self.paths.service, self.paths.timer,
                      self.root / "installed.json", self.root / ".installation-complete"):
             self.assertFalse(path.exists(), str(path))
         for path in (self.root / "releases/keep.data", self.root / "shared/keep.data", self.root / "config.json",
@@ -306,6 +307,22 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn("操作失败", terminal.output.getvalue())
         self.assertIn('自动更新：开启', terminal.output.getvalue())
         self.assertEqual(self.locked_paths, [])
+
+    def test_menu_displays_short_command_and_install_directory(self):
+        terminal = Terminal("0\n")
+        with patch.object(console, "_open_terminal", return_value=terminal):
+            self.assertEqual(console.run_menu(self.manager, self.locked, paths=self.paths), 0)
+        self.assertIn("菜单入口：sudo xw", terminal.output.getvalue())
+        self.assertIn("安装目录：" + str(self.root), terminal.output.getvalue())
+        self.assertEqual(self.locked_paths, [])
+
+    def test_menu_uses_long_command_if_shortcut_is_foreign(self):
+        self.paths.shortcut.write_bytes(b"\xff\x00foreign binary")
+        terminal = Terminal("0\n")
+        with patch.object(console, "_open_terminal", return_value=terminal):
+            self.assertEqual(console.run_menu(self.manager, self.locked, paths=self.paths), 0)
+        self.assertIn("菜单入口：sudo xiaowork-watch", terminal.output.getvalue())
+        self.assertEqual(self.paths.shortcut.read_bytes(), b"\xff\x00foreign binary")
 
     def test_menu_uninstall_requires_confirmation_and_exits_after_removal(self):
         # The old generic keep.data fixtures are not owned deployment artifacts.
