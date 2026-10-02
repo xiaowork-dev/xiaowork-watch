@@ -28,6 +28,7 @@ def package(project, output, commit):
     version = json.loads((project / 'package.json').read_text(encoding='utf-8'))['version']
     files['release.json'] = (json.dumps({'schema': 1, 'kind': 'frontend-prototype', 'commit': commit, 'version': version}, sort_keys=True) + '\n').encode()
     files['.deploy/manage.py'] = (project / 'scripts/deploy/manage.py').read_bytes()
+    files['.deploy/console.py'] = (project / 'scripts/deploy/console.py').read_bytes()
     output.mkdir(parents=True, exist_ok=True)
     archive = output / 'xiaowork-watch-web.tar.gz'
     with archive.open('wb') as raw:

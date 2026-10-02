@@ -1,6 +1,6 @@
 # xiaowork Watch
 
-面向个人开发者的 网站与 VPS 监控平台。本次交付为 v0.2.1 **可交互的前端原型**，采用 Vue 3 + Vite + Axios；实际后端仍按开发文档规划使用 Java 21 + Spring Boot + MySQL 8 + MyBatis-Plus。
+面向个人开发者的 网站与 VPS 监控平台。本次交付为 v0.2.2 **可交互的前端原型**，采用 Vue 3 + Vite + Axios；实际后端仍按开发文档规划使用 Java 21 + Spring Boot + MySQL 8 + MyBatis-Plus。
 
 ## 原型范围
 
@@ -27,15 +27,15 @@ npm run dev
 
 ## 服务器部署
 
-保留自己拉取 Git 源码、构建并使用 Nginx 托管的方式。也可在 Ubuntu/Debian 上一条命令安装 GitHub 前端发布包：
+保留自己拉取 Git 源码、构建并使用 Nginx 托管的方式。也可在 Ubuntu/Debian 的 SSH 终端用一条命令打开部署菜单：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/xiaowork-dev/xiaowork-watch/main/install.sh | sudo bash
 ```
 
-默认访问 `http://服务器IP:8088`。每次推送 main 会触发 GitHub Actions 测试、构建和发布，服务器约每 15 分钟检查更新。可使用 `sudo xiaowork-watch update` 手动更新、`sudo xiaowork-watch rollback` 回退；回退会暂停自动更新。此安装器仅部署当前前端原型。
+首次显示“部署 / 卸载 / 退出”；选择部署成功后，自动进入管理菜单。以后运行 `sudo xiaowork-watch` 打开菜单，可配置域名 HTTP 反代、更新、回退、开关自动更新、查看日志及卸载。默认访问 `http://服务器IP:8088`。main 推送后自动构建发布，服务器约每 15 分钟检查更新。卸载保留历史包和共享资源，回退不会降级管理菜单。此安装器仅部署当前前端原型。
 
-自选端口、域名、手动源码部署和管理命令见 [服务器部署说明](docs/deployment/server.md)。
+旧 v0.2.1 服务器可先运行 `sudo xiaowork-watch update`，再运行 `sudo xiaowork-watch`。无交互终端时显式加 `--non-interactive` 部署。自选端口、域名、手动源码部署和管理命令见 [服务器部署说明](docs/deployment/server.md)。
 
 ## 文件结构
 

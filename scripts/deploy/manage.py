@@ -520,16 +520,45 @@ class Manager:
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default="/opt/xiaowork-watch")
-    commands = parser.add_subparsers(dest="command", required=True)
+    commands = parser.add_subparsers(dest="command")
     installer = commands.add_parser("install")
     installer.add_argument("--release-tag", help="Pin initial installation to web-fullSHA")
     updater = commands.add_parser("update")
     updater.add_argument("--automatic", action="store_true", help="Respect rollback's update pause")
     commands.add_parser("rollback")
     commands.add_parser("status")
+    commands.add_parser("menu", help="Open the Chinese server management menu")
+    proxy = commands.add_parser("proxy", help="Configure an HTTP domain reverse proxy")
+    proxy.add_argument("domain")
+    automatic = commands.add_parser("auto-update", help="Enable or pause automatic updates")
+    automatic.add_argument("state", choices=("on", "off"))
+    removal = commands.add_parser("uninstall", help="Remove this deployment's service entries; keep downloaded data")
+    removal.add_argument("--confirm", action="store_true", help="Explicitly confirm removal without an interactive menu")
     args = parser.parse_args(argv)
     try:
         manager = Manager(args.root)
+        console = None
+        module_path = Path(__file__).resolve().with_name("console.py")
+        if _regular(module_path):
+            import importlib.util
+            specification = importlib.util.spec_from_file_location("xiaowork_watch_console", str(module_path))
+            console = importlib.util.module_from_spec(specification)
+            sys.modules[specification.name] = console
+            specification.loader.exec_module(console)
+            console.ensure_control_entry(manager, locked=_locked)
+        if args.command in (None, "menu", "proxy", "auto-update", "uninstall"):
+            if console is None:
+                raise DeploymentError("Menu tools are unavailable. Update or run the latest install.sh to open the menu.")
+            if args.command in (None, "menu"):
+                return console.run_menu(manager, _locked)
+            if args.command == "proxy":
+                result = console.configure_proxy(manager, args.domain, locked=_locked)
+            elif args.command == "auto-update":
+                result = console.set_auto_update(manager, args.state == "on", locked=_locked)
+            else:
+                result = console.uninstall(manager, confirm=args.confirm, locked=_locked)
+            print(json.dumps(result, sort_keys=True, ensure_ascii=False))
+            return 0
         with _locked(manager.root / ".deploy.lock"):
             if args.command == "install":
                 result = manager.install_or_update(tag=args.release_tag)
@@ -539,6 +568,9 @@ def main(argv=None):
                 result = manager.rollback()
             else:
                 result = manager.status()
+        if (console is not None and args.command in ("install", "update")
+                and result.get("status") == "installed"):
+            console.ensure_control_entry(manager, locked=_locked, refresh=True)
         print(json.dumps(result, sort_keys=True))
         return 0
     except (DeploymentError, OSError, ValueError) as error:

@@ -24,7 +24,8 @@ class PackageTests(unittest.TestCase):
         (self.root / 'dist/index.html').write_text('<html>prototype</html>')
         (self.root / 'dist/assets/index-a1.js').write_text('console.log(1)')
         (self.root / 'scripts/deploy/manage.py').write_text('# verified manager\n')
-        (self.root / 'package.json').write_text(json.dumps({'version': '0.2.1'}))
+        (self.root / 'scripts/deploy/console.py').write_text('# verified console\n')
+        (self.root / 'package.json').write_text(json.dumps({'version': '0.2.2'}))
         (self.root / '.env').write_text('SECRET=never-package-this')
         self.sha = 'a' * 40
 
@@ -39,11 +40,11 @@ class PackageTests(unittest.TestCase):
         digest = hashlib.sha256(first.read_bytes()).hexdigest()
         self.assertTrue(first.with_name(first.name + '.sha256').read_text().startswith(digest + '  '))
         with tarfile.open(first) as archive:
-            self.assertEqual(set(archive.getnames()), {'index.html', 'assets/index-a1.js', 'release.json', '.deploy/manage.py'})
+            self.assertEqual(set(archive.getnames()), {'index.html', 'assets/index-a1.js', 'release.json', '.deploy/manage.py', '.deploy/console.py'})
             metadata = json.load(archive.extractfile('release.json'))
             self.assertEqual(metadata['commit'], self.sha)
             self.assertEqual(metadata['kind'], 'frontend-prototype')
-            self.assertEqual(metadata['version'], '0.2.1')
+            self.assertEqual(metadata['version'], '0.2.2')
             self.assertTrue(all(member.isfile() and member.mode == 0o644 for member in archive))
 
     def test_hidden_build_file_rejected(self):
