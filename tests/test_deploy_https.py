@@ -61,9 +61,6 @@ class HttpsTests(unittest.TestCase):
         self.default_ini = self.system / "global" / "cli.ini"
         self.default_ini.parent.mkdir()
         self.xdg_home = self.system / "xdg"
-        defaults = patch.object(console, "CERTBOT_SYSTEM_CONFIG", self.default_ini)
-        defaults.start()
-        self.addCleanup(defaults.stop)
         environment = patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.xdg_home)})
         environment.start()
         self.addCleanup(environment.stop)
@@ -166,6 +163,9 @@ class HttpsTests(unittest.TestCase):
     def runtime(self, health=None):
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(console, "_run", side_effect=self.command))
+            stack.enter_context(patch.object(console, "_run_certbot", side_effect=lambda arguments, **options:
+                                              self.command(["certbot"] + list(arguments), **options)))
+            stack.enter_context(patch.object(console, "_certbot_available", side_effect=lambda: self.tools))
             stack.enter_context(patch.object(console.shutil, "which", side_effect=lambda name: "/usr/bin/" + name if self.tools else None))
             stack.enter_context(patch.object(console, "_https_health", side_effect=health))
             stack.enter_context(patch("sys.stdout", new=io.StringIO()))
@@ -205,6 +205,8 @@ class HttpsTests(unittest.TestCase):
             self.assertIn(flag, args)
         self.assertEqual(args[args.index("--server") + 1], console.ACME_SERVER)
         self.assertEqual(args[args.index("--config") + 1], "/dev/null")
+        for hook in ("--pre-hook", "--post-hook", "--deploy-hook"):
+            self.assertEqual(args[args.index(hook) + 1], "")
         for flag, folder in (("--config-dir", "letsencrypt"), ("--work-dir", "certbot-work"), ("--logs-dir", "certbot-logs")):
             self.assertEqual(args[args.index(flag) + 1], str(self.root / "shared" / folder))
         self.assertFalse(any("certbot.timer" in arguments for arguments, _ in self.calls))
@@ -287,95 +289,40 @@ class HttpsTests(unittest.TestCase):
         self.assertEqual(packages[1][0], ["apt-get", "install", "-y", "certbot", "openssl"])
         self.assertTrue(all(options["timeout"] == 600 for _, options in packages))
 
-    def test_active_global_config_blocks_issuance_and_renewal_without_changes(self):
+    def test_existing_global_and_user_ini_do_not_block_issuance_or_renewal(self):
         user_ini = self.xdg_home / "letsencrypt" / "cli.ini"
         user_ini.parent.mkdir(parents=True)
-        for ini in (self.default_ini, user_ini):
-            with self.subTest(path=ini):
-                original_proxy = self.paths.nginx_proxy.read_bytes()
-                original_config = (self.root / "config.json").read_bytes()
-                ini.write_text("# existing setup\ndeploy-hook = private-command\n", encoding="utf-8")
-                with self.runtime(), self.assertRaises(console.ConsoleError) as failure:
-                    self.apply()
-                self.assertNotIn("private-command", str(failure.exception))
-                self.assertEqual(self.calls, [])
-                self.assertEqual(self.paths.nginx_proxy.read_bytes(), original_proxy)
-                self.assertEqual((self.root / "config.json").read_bytes(), original_config)
-                self.assertIn("private-command", ini.read_text(encoding="utf-8"))
-                ini.unlink()
+        snapshots = {}
+        for ini, content in ((self.default_ini, "deploy-hook = private-command\n"),
+                             (user_ini, "pre-hook = private-renew-hook\n")):
+            ini.write_text(content, encoding="utf-8")
+            snapshots[ini] = ini.read_bytes()
         with self.runtime():
             self.apply()
         self.calls = []
         original_config = (self.root / "config.json").read_bytes()
         original_proxy = self.paths.nginx_proxy.read_bytes()
-        user_ini.write_text("pre-hook = private-renew-hook\n", encoding="utf-8")
-        with self.runtime(), self.assertRaises(console.ConsoleError):
+        with self.runtime():
             console.renew_https(self.manager, paths=self.paths, locked=self.locked)
-        self.assertEqual(self.calls, [])
+        self.assertTrue(any(args[:2] == ["certbot", "renew"] for args, _ in self.calls))
         self.assertEqual(self.paths.nginx_proxy.read_bytes(), original_proxy)
         self.assertEqual((self.root / "config.json").read_bytes(), original_config)
+        for ini, content in snapshots.items():
+            self.assertEqual(ini.read_bytes(), content)
 
-    def test_default_config_paths_comments_and_unsafe_files(self):
-        self.default_ini.write_text("\n # Debian sample\n ; comments\n\t\n", encoding="utf-8")
-        with self.runtime():
-            self.apply()
-        self.default_ini.unlink()
-        home = self.system / "home"
-        relative = self.system / "letsencrypt" / "cli.ini"
-        relative.parent.mkdir()
-        relative.write_text("staging = true\n", encoding="utf-8")
-        previous_cwd = Path.cwd()
-        try:
-            os.chdir(self.system)
-            with patch.dict(os.environ, {"XDG_CONFIG_HOME": ""}), self.assertRaises(console.ConsoleError):
-                console._check_certbot_defaults()
-        finally:
-            os.chdir(previous_cwd)
-        for xdg, target in (("~/.config", home / ".config/letsencrypt/cli.ini"),
-                            (str(self.system / "xdg-*"), self.system / "xdg-one/letsencrypt/cli.ini")):
-            with self.subTest(xdg=xdg):
-                target.parent.mkdir(parents=True)
-                target.write_text("force-renewal = true\n", encoding="utf-8")
-                original_expanduser = os.path.expanduser
-                def expanduser(path):
-                    return str(home / path[2:]) if path.startswith("~/") else original_expanduser(path)
-                with patch.dict(os.environ, {"XDG_CONFIG_HOME": xdg}), patch.object(
-                        console.os.path, "expanduser", side_effect=expanduser), self.assertRaises(console.ConsoleError):
-                    console._check_certbot_defaults()
-                if xdg == "~/.config":
-                    with patch.dict(os.environ), patch.object(console.os.path, "expanduser", side_effect=expanduser):
-                        os.environ.pop("XDG_CONFIG_HOME", None)
-                        with self.assertRaises(console.ConsoleError):
-                            console._check_certbot_defaults()
-                target.unlink()
-        self.default_ini.mkdir()
-        with self.assertRaises(console.ConsoleError):
-            console._check_certbot_defaults()
-        self.default_ini.rmdir()
-        self.default_ini.write_text("# harmless\n", encoding="utf-8")
-        with patch.object(console, "_read_regular", side_effect=PermissionError("private")), self.assertRaises(console.ConsoleError):
-            console._check_certbot_defaults()
-        if os.name == "posix":
-            self.default_ini.unlink()
-            self.default_ini.symlink_to(relative)
-            with self.assertRaises(console.ConsoleError):
-                console._check_certbot_defaults()
-
-    def test_apt_created_active_default_config_is_rechecked_before_acme(self):
+    def test_apt_created_global_ini_does_not_block_isolated_certificate_request(self):
         self.tools = False
-        old_proxy = self.paths.nginx_proxy.read_bytes()
-        old_config = (self.root / "config.json").read_bytes()
         original_command = self.command
         def command(arguments, **kwargs):
             result = original_command(arguments, **kwargs)
             if arguments[:3] == ["apt-get", "install", "-y"]:
                 self.default_ini.write_text("post-hook = package-hook\n", encoding="utf-8")
             return result
-        with self.runtime(), patch.object(console, "_run", side_effect=command), self.assertRaises(console.ConsoleError):
+        with self.runtime(), patch.object(console, "_run", side_effect=command):
             self.apply()
-        self.assertFalse(any(args[0] == "certbot" for args, _ in self.calls))
-        self.assertEqual(self.paths.nginx_proxy.read_bytes(), old_proxy)
-        self.assertEqual((self.root / "config.json").read_bytes(), old_config)
+        self.assertTrue(any(args[:2] == ["certbot", "certonly"] for args, _ in self.calls))
+        self.assertTrue(self.manager._config()["httpsEnabled"])
+        self.assertTrue(self.timer_enabled)
         self.assertEqual(self.default_ini.read_text(encoding="utf-8"), "post-hook = package-hook\n")
 
     def test_owned_certificate_namespace_refuses_unmarked_existing_data(self):
@@ -399,6 +346,7 @@ class HttpsTests(unittest.TestCase):
         self.assertIn("--cert-name", args)
         self.assertEqual(args[args.index("--cert-name") + 1], console.TLS_NAME)
         self.assertNotIn("--dry-run", args)
+        self.assertIn("--no-random-sleep-on-renew", args)
         self.assertIn(["nginx", "-t"], [args for args, _ in self.calls])
         self.assertIn(["systemctl", "reload", "nginx"], [args for args, _ in self.calls])
 
@@ -450,6 +398,35 @@ class HttpsTests(unittest.TestCase):
         configure.assert_called_once_with(self.manager, DOMAIN, "ops@example.com", paths=self.paths, locked=self.locked)
         self.assertIn("80/443", terminal.output.getvalue())
         self.assertIn("Let's Encrypt", terminal.output.getvalue())
+
+    def test_https_consent_accepts_yes_or_y_in_any_case(self):
+        for consent in ("YES", "yes", "y", "Y", "YeS"):
+            with self.subTest(consent=consent):
+                terminal = Terminal("8\n\nops@example.com\n" + consent + "\n0\n")
+                with patch.object(console, "_open_terminal", return_value=terminal), patch.object(
+                        console, "configure_https", return_value={"url": "https://" + DOMAIN + "/"}) as configure:
+                    self.assertEqual(console.run_menu(self.manager, self.locked, paths=self.paths), 0)
+                configure.assert_called_once_with(self.manager, DOMAIN, "ops@example.com", paths=self.paths, locked=self.locked)
+
+    def test_https_consent_empty_no_eof_and_unsafe_input_do_not_approve(self):
+        for consent in ("\n0\n", "NO\n0\n", "", "yes; touch /tmp/x\n0\n", "y --evil\n0\n",
+                        "ＹＥＳ\n0\n", "Y\x00ES\n0\n", "Y\ufffdES\nNO\n0\n"):
+            with self.subTest(consent=consent):
+                terminal = Terminal("8\n\nops@example.com\n" + consent)
+                with patch.object(console, "_open_terminal", return_value=terminal), patch.object(console, "configure_https") as configure:
+                    self.assertEqual(console.run_menu(self.manager, self.locked, paths=self.paths), 0)
+                configure.assert_not_called()
+                self.assertIn("已取消 HTTPS 配置", terminal.output.getvalue())
+
+    def test_yes_shortcut_does_not_approve_uninstall_or_rollback(self):
+        for consent in ("YES", "yes", "y", "Y", "YeS", "uninstall", "rollback"):
+            with self.subTest(consent=consent):
+                terminal = Terminal("7\n" + consent + "\n4\n" + consent + "\n0\n")
+                with patch.object(console, "_open_terminal", return_value=terminal), patch.object(console, "uninstall") as uninstall:
+                    self.manager.rollback = unittest.mock.Mock()
+                    self.assertEqual(console.run_menu(self.manager, self.locked, paths=self.paths), 0)
+                uninstall.assert_not_called()
+                self.manager.rollback.assert_not_called()
 
     def test_checkhost_zero_exit_but_mismatch_output_is_rejected(self):
         with patch.object(console, "_certificate_target", return_value=Path("fixture.pem")), patch.object(

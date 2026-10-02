@@ -2,7 +2,6 @@
 """Chinese terminal operations for the managed static frontend (Python 3.8+)."""
 import contextlib
 from dataclasses import dataclass
-import glob
 import io
 import json
 import os
@@ -28,7 +27,7 @@ TLS_SERVICE = "xiaowork-watch-certbot-renew.service"
 TLS_TIMER = "xiaowork-watch-certbot-renew.timer"
 ACME_SERVER = "https://acme-v02.api.letsencrypt.org/directory"
 HTTPS_PORT = 443
-CERTBOT_SYSTEM_CONFIG = Path("/etc/letsencrypt/cli.ini")
+CERTBOT_PYTHON = "/usr/bin/python3"
 
 
 class ConsoleError(ValueError):
@@ -69,10 +68,11 @@ Persistent=true
 WantedBy=timers.target"""
 
 
-def _run(arguments, timeout=30):
+def _run(arguments, timeout=30, display_arguments=None):
+    display = display_arguments or arguments
     try:
         if timeout > 30:
-            print("正在执行：" + " ".join(arguments[:3]) + "，请稍候……", flush=True)
+            print("正在执行：" + " ".join(display[:3]) + "，请稍候……", flush=True)
         environment = os.environ.copy()
         environment["DEBIAN_FRONTEND"] = "noninteractive"
         result = subprocess.run(arguments, check=True, stdout=subprocess.PIPE,
@@ -81,9 +81,9 @@ def _run(arguments, timeout=30):
         return result.stdout + result.stderr
     except subprocess.CalledProcessError as error:
         detail = (error.stderr or error.stdout or str(error)).strip()
-        raise ConsoleError("命令失败：" + " ".join(arguments) + "\n" + detail) from error
+        raise ConsoleError("命令失败：" + " ".join(display) + "\n" + detail) from error
     except (OSError, subprocess.TimeoutExpired) as error:
-        raise ConsoleError("无法完成命令：" + " ".join(arguments) + "\n" + str(error)) from error
+        raise ConsoleError("无法完成命令：" + " ".join(display) + "\n" + str(error)) from error
 
 
 def _read_regular(path):
@@ -547,24 +547,39 @@ def _https_health(manager, domain):
 
 def _certbot_arguments(folders):
     return ["--config", "/dev/null", "--server", ACME_SERVER, "--no-directory-hooks",
+            "--pre-hook", "", "--post-hook", "", "--deploy-hook", "",
             "--config-dir", str(folders["certs"]), "--work-dir", str(folders["work"]),
             "--logs-dir", str(folders["logs"])]
 
 
-def _check_certbot_defaults():
-    # --config /dev/null does not replace Certbot's default config file list.
-    # Match its expanduser/glob behavior, including an explicitly empty XDG value.
-    patterns = (str(CERTBOT_SYSTEM_CONFIG),
-                os.path.join(os.environ.get("XDG_CONFIG_HOME", "~/.config"), "letsencrypt", "cli.ini"))
-    for pattern in patterns:
-        for candidate in glob.glob(os.path.expanduser(pattern)):
-            path = Path(candidate)
-            try:
-                text = _read_regular(path)
-            except (ConsoleError, OSError, UnicodeError) as error:
-                raise ConsoleError("无法安全读取默认 Certbot 配置，已保留文件并停止：" + str(path)) from error
-            if any(line.strip() and not line.strip().startswith(("#", ";")) for line in text.splitlines()):
-                raise ConsoleError("检测到已有全局 Certbot 配置，已保留文件并停止，未执行证书申请或全局 hooks：" + str(path))
+def _isolated_certbot_main(arguments):
+    """Disable implicit cli.ini sources only in this disposable Certbot process."""
+    os.environ.pop("CERTBOT_SNAPPED", None)  # This runner uses the system apt module.
+    try:
+        from certbot._internal import constants
+    except ImportError as error:
+        raise ConsoleError("系统 Python 的 Certbot 模块不可用，请通过 apt 安装 certbot。") from error
+    defaults = getattr(constants, "CLI_DEFAULTS", None)
+    if not isinstance(defaults, dict) or not isinstance(defaults.get("config_files"), (list, tuple)):
+        raise ConsoleError("此 Certbot 版本无法隔离默认配置，未开始证书操作。请使用系统 apt 版本。")
+    # --config /dev/null alone still loads the default config list. Clear the
+    # actual parser defaults before importing the main entry point.
+    constants.CLI_DEFAULTS = dict(defaults, config_files=[])
+    from certbot._internal import main
+    return main.main(arguments)
+
+
+def _run_certbot(arguments, timeout=600):
+    command = [CERTBOT_PYTHON, "-I", str(Path(__file__).resolve()), "--isolated-certbot"] + list(arguments)
+    return _run(command, timeout=timeout, display_arguments=["certbot"] + list(arguments))
+
+
+def _certbot_available():
+    try:
+        _run_certbot(["--version"], timeout=30)
+        return True
+    except ConsoleError:
+        return False
 
 
 def _unit_state(name, query):
@@ -618,7 +633,6 @@ def configure_https(manager, domain, email, paths=DEFAULT_PATHS, locked=None):
         was_tls = bool(config.get("httpsEnabled"))
         if re.search(r"\bssl_certificate\b", old_proxy) and not was_tls:
             raise ConsoleError("已有 HTTPS 配置未登记为本工具管理，已保留；请先检查证书归属。")
-        _check_certbot_defaults()
         folders = _tls_directories(manager, create=True)
         certificate_state = _certificate_snapshot(folders)
         prior_domain = _tls_domain(config.get("tlsDomain") or config.get("proxyDomain")) if was_tls else None
@@ -630,23 +644,21 @@ def configure_https(manager, domain, email, paths=DEFAULT_PATHS, locked=None):
         active = _unit_state(TLS_TIMER, "is-active") if paths.tls_timer in snapshots else False
         timer_touched = False
         try:
-            if not shutil.which("certbot") or not shutil.which("openssl"):
+            if not _certbot_available() or not shutil.which("openssl"):
                 _run(["apt-get", "update"], timeout=600)
                 _run(["apt-get", "install", "-y", "certbot", "openssl"], timeout=600)
-            if not shutil.which("certbot") or not shutil.which("openssl"):
-                raise ConsoleError("Certbot 或 OpenSSL 安装后仍不可用。")
-            # A package installation may have created a default cli.ini.
-            _check_certbot_defaults()
+                if not _certbot_available() or not shutil.which("openssl"):
+                    raise ConsoleError("系统 apt 的 Certbot 或 OpenSSL 安装后仍不可用。")
             print("正在准备 IPv4 HTTP-01 验证；域名 A 记录需指向服务器且不应保留无效 AAAA，已有 HTTPS 会继续提供服务。", flush=True)
             domains = " ".join(dict.fromkeys((prior_domain, domain))) if prior_domain else domain
             _write(paths.nginx_proxy, _tls_proxy(manager, domain, config, folders, tls_domain=prior_domain, http_domains=domains))
             _nginx_reload()
             print("正在向 Let's Encrypt 申请或检查证书，可能需要几分钟。", flush=True)
-            arguments = ["certbot", "certonly"] + _certbot_arguments(folders) + [
+            arguments = ["certonly"] + _certbot_arguments(folders) + [
                 "--cert-name", TLS_NAME, "--keep-until-expiring", "--renew-with-new-domains",
                 "--non-interactive", "--agree-tos", "--email", email, "--preferred-challenges", "http",
                 "--webroot", "-w", str(folders["acme"]), "-d", domain]
-            _run(arguments, timeout=600)
+            _run_certbot(arguments, timeout=600)
             _validate_certificates(folders, domain)
             _write(paths.nginx_proxy, _tls_proxy(manager, domain, config, folders, tls_domain=domain))
             _nginx_reload()
@@ -696,10 +708,9 @@ def renew_https(manager, paths=DEFAULT_PATHS, locked=None):
         for path, kind in ((paths.nginx_proxy, "proxy"), (paths.tls_service, "tls-service"), (paths.tls_timer, "tls-timer")):
             if not _owned(path, manager, kind, paths):
                 raise ConsoleError("HTTPS 续期配置不属于此安装：" + str(path))
-        _check_certbot_defaults()
         folders = _tls_directories(manager)
-        _run(["certbot", "renew"] + _certbot_arguments(folders) + [
-            "--cert-name", TLS_NAME, "--quiet", "--non-interactive"], timeout=600)
+        _run_certbot(["renew"] + _certbot_arguments(folders) + [
+            "--cert-name", TLS_NAME, "--quiet", "--non-interactive", "--no-random-sleep-on-renew"], timeout=600)
         _validate_certificates(folders, domain)
         _nginx_reload()
         _https_health(manager, domain)
@@ -1079,7 +1090,7 @@ def run_menu(manager, locked, paths=DEFAULT_PATHS):
                         continue
                     domain, email = _tls_domain(domain), _email(email)
                     _say(terminal, "请确认域名 A 记录已指向此服务器，当前入口仅支持 IPv4，请移除该域名的 AAAA；80/443 端口已开放，并同意 Let's Encrypt 服务条款：https://letsencrypt.org/repository/")
-                    if _ask(terminal, "输入 YES 确认并申请证书：") != "YES":
+                    if (_ask(terminal, "输入 yes/y 确认并申请证书（不区分大小写）：") or "").lower() not in {"yes", "y"}:
                         _say(terminal, "已取消 HTTPS 配置。")
                         continue
                     result = configure_https(manager, domain, email, paths=paths, locked=locked)
@@ -1088,3 +1099,12 @@ def run_menu(manager, locked, paths=DEFAULT_PATHS):
                     _say(terminal, "请选择菜单中的编号。")
             except Exception as error:
                 _say(terminal, "操作失败：" + str(error) + "\n可修正后重试，或输入 0 退出。")
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] != ["--isolated-certbot"]:
+        sys.exit("请使用 xiaowork-watch 管理命令。")
+    try:
+        sys.exit(_isolated_certbot_main(sys.argv[2:]))
+    except (ConsoleError, ImportError) as error:
+        sys.exit(str(error))

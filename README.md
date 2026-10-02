@@ -1,6 +1,6 @@
 # xiaowork Watch
 
-面向个人开发者的 网站与 VPS 监控平台。本次交付为 v0.2.5 **可交互的前端原型**，采用 Vue 3 + Vite + Axios；实际后端仍按开发文档规划使用 Java 21 + Spring Boot + MySQL 8 + MyBatis-Plus。
+面向个人开发者的 网站与 VPS 监控平台。本次交付为 v0.2.6 **可交互的前端原型**，采用 Vue 3 + Vite + Axios；实际后端仍按开发文档规划使用 Java 21 + Spring Boot + MySQL 8 + MyBatis-Plus。
 
 ## 原型范围
 

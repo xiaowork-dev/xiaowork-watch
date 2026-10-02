@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.6-prototype — 2026-10-02
+
+- 修复已有全局 Certbot 配置时，HTTPS 申请和续期被拒绝的问题。
+- 独立 Certbot 进程排除默认配置来源，继续使用本项目专属目录，禁用目录与保存的 hooks；保留其他站点配置。
+- HTTPS 确认支持 YES、yes、y、Y 及混合大小写。
+- 增加 Ubuntu/Debian 真实 Certbot 离线兼容检查，发布前验证配置隔离与续期参数。
+
 ## 0.2.5-prototype — 2026-10-02
 
 - 修复终端粘贴含无效 UTF-8 字节时，HTTPS 配置与菜单读取中断的问题。

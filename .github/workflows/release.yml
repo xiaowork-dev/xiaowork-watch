@@ -13,7 +13,26 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  certbot-debian:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    container: debian:trixie-slim
+    timeout-minutes: 10
+    steps:
+      - name: Install Debian Certbot test dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates python3 certbot openssl
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Test isolated Certbot without ACME requests
+        run: |
+          /usr/bin/python3 -c "from certbot._internal import constants"
+          /usr/bin/python3 -m unittest discover -s tests -p 'test_deploy_certbot.py' -v
   build-and-release:
+    needs: certbot-debian
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -31,14 +50,15 @@ jobs:
           package-manager-cache: false
       - name: Install dependencies
         run: npm ci
-      - name: Install local Nginx test dependencies
+      - name: Install local Nginx and Certbot test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends nginx openssl
+          sudo apt-get install -y --no-install-recommends nginx openssl certbot
       - name: Test installer and updater
         run: |
           bash -n install.sh
-          python3 -m unittest discover -s tests -p 'test_deploy*.py' -v
+          /usr/bin/python3 -c "from certbot._internal import constants"
+          /usr/bin/python3 -m unittest discover -s tests -p 'test_deploy*.py' -v
       - name: Build frontend prototype
         run: npm run build
       - name: Package verified build

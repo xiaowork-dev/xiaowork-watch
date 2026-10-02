@@ -1,6 +1,6 @@
 # 服务器部署与 GitHub 自动更新
 
-当前 v0.2.5 提供两条部署路径：自己拉取源码构建，或通过中文终端菜单部署 GitHub 的发布包。两种方式部署的都是**前端交互原型**；尚无真实主控后端、数据库或 Linux VPS 探针。首次访问的网站、VPS、测试节点及检测历史为空，由自己添加。已有浏览器中的配置、历史和旧样例不会自动清除。
+当前 v0.2.6 提供两条部署路径：自己拉取源码构建，或通过中文终端菜单部署 GitHub 的发布包。两种方式部署的都是**前端交互原型**；尚无真实主控后端、数据库或 Linux VPS 探针。首次访问的网站、VPS、测试节点及检测历史为空，由自己添加。已有浏览器中的配置、历史和旧样例不会自动清除。
 
 ## 方式一：一键安装并自动更新
 
@@ -65,11 +65,11 @@ sudo xiaowork-watch update
 sudo xiaowork-watch
 ```
 
-选 **8. 配置 HTTPS**。输入自己的域名和邮箱；当前已配置的反代域名会作为默认值。确认 DNS、端口及 Let's Encrypt 服务条款后，输入 `YES` 开始申请。成功后 HTTP 自动跳转 HTTPS，Nginx 反代通过 443 提供加密访问，本地原站端口和更新健康检查继续使用 HTTP。
+选 **8. 配置 HTTPS**。输入自己的域名和邮箱；当前已配置的反代域名会作为默认值。确认 DNS、端口及 Let's Encrypt 服务条款后，输入 `yes` 或 `y` 开始申请（不区分大小写），其他输入取消。成功后 HTTP 自动跳转 HTTPS，Nginx 反代通过 443 提供加密访问，本地原站端口和更新健康检查继续使用 HTTP。
 
 程序按需安装 Certbot 和 OpenSSL，以 webroot 方式申请证书，只操作本项目专用的反代配置。证书、账户和日志位于安装目录下的 `shared/letsencrypt`、`shared/certbot-work`、`shared/certbot-logs`；验证文件位于 `shared/acme`。账号与私钥不放入 GitHub 或网页公开目录。签发或配置检查失败时恢复原站点配置；重新申请不强制每日签发新证书。
 
-如果服务器已有带配置内容的全局 Certbot `cli.ini`，工具会停止证书操作并显示文件路径，保留原配置，避免继承其他站点的签发选项或钩子。不要直接删除其他站点使用的配置；这种情况下可继续沿用自己已有的证书管理方式。
+已有全局 `/etc/letsencrypt/cli.ini` 或用户级 Certbot 配置不再阻止 HTTPS。工具使用系统 apt 的 Certbot，在独立进程中排除默认配置来源，并将证书、账户、工作目录与日志限制在本项目的专属目录；申请及续期均禁用目录 hooks 和保存的前置、后置、部署 hooks。无需删除或修改已有 Certbot 配置。
 
 本项目的 `xiaowork-watch-certbot-renew.timer` 每天检查续期，带随机延迟；只有接近到期时 Certbot 才更新证书。续期成功后检查并重载 Nginx。暂停网页自动更新或回退网页版本不会停掉证书续期。查看日志与立即检查：
 
@@ -80,7 +80,7 @@ sudo xiaowork-watch renew-https
 
 浏览器本地数据按域名、协议和端口分别保存。从 HTTP 切换到 HTTPS 后属于新的访问来源，列表会首次以空数据开始；HTTP 来源中的旧数据仍在原浏览器中。当前原型没有服务器数据库，不会自动跨来源迁移配置。
 
-DNS 未生效、错误 AAAA 记录、80/443 未开放或已有域名站点冲突时，应先修正再尝试。证书签发与公网验证在自己 VPS 上执行；CI 仅使用本地临时证书检查 Nginx、反代和挑战路径。[Certbot 官方说明](https://eff-certbot.readthedocs.io/en/stable/using.html)介绍 webroot 验证与自动续期。
+DNS 未生效、错误 AAAA 记录、80/443 未开放或已有域名站点冲突时，应先修正再尝试。证书签发与公网验证在自己 VPS 上执行；CI 使用本地临时证书检查 Nginx、反代和挑战路径，并在 Ubuntu/Debian 上通过真实 Certbot 离线检查配置隔离与续期参数。[Certbot 官方说明](https://eff-certbot.readthedocs.io/en/stable/using.html)介绍 webroot 验证与自动续期。
 
 ### 彻底卸载
 
