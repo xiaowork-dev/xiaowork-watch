@@ -46,12 +46,23 @@ elif name=="mktemp":
 elif name=="install":
     shutil.copyfile(args[-2],args[-1])
     os.chmod(args[-1],int(args[args.index("-m")+1],8))
-elif name=="stat": print("0")  # Owned root metadata in the isolated fixture.
+elif name=="stat":
+    if args[1]=="%a": print(oct(pathlib.Path(args[-1]).stat().st_mode & 0o7777)[2:])
+    else: print("0")  # Owned root metadata in the isolated fixture.
 elif name=="systemctl":
     if args[:2]==["enable","--now"]:
         if os.environ.get("AGENT_TEST_FAIL_START"): code=1
         else: state["active"]=True
     elif args[:2]==["disable","--now"]: state["active"]=False
+    elif args[:1]==["restart"]:
+        state["restarts"]=state.get("restarts",0)+1
+        if os.environ.get("AGENT_TEST_FAIL_UPGRADE") and state["restarts"]==1:
+            code=1
+            state["active"]=False
+        elif os.environ.get("AGENT_TEST_UPGRADE_INACTIVE") and state["restarts"]==1:
+            state["active"]=False
+        else: state["active"]=True
+    elif args[:1]==["stop"]: state["active"]=False
     elif args[:2]==["is-active","--quiet"]: code=0 if state["active"] else 1
 elif name in ("chown","apt-get"): pass
 else: raise RuntimeError("Unexpected fixture command: "+name)
@@ -117,19 +128,20 @@ class InstallerTransactionTests(unittest.TestCase):
         def respond(path, body):
             self.assertEqual(path, "/api/agent/enroll")
             self.assertEqual(body, {"token": TOKEN})
-            return success({"credential": CREDENTIAL, "role": "probe", "id": 1, "heartbeatSeconds": 30})
+            return success({"credential": CREDENTIAL, "role": "vps", "id": 1, "heartbeatSeconds": 30})
         self.server, self.api_calls = self.stack.enter_context(http_fixture(respond))
 
     def state(self):
         return json.loads(self.state_path.read_text())
 
-    def run_installer(self, uninstall=False, extra_env=None):
+    def run_installer(self, uninstall=False, upgrade=False, extra_env=None, server=None):
         arguments = ["bash", str(self.script)]
         if uninstall:
             arguments += ["--uninstall"]
         else:
-            arguments += ["--server", self.server, "--enrollment-token", TOKEN,
+            arguments += ["--server", server or self.server,
                           "--agent-sha", hashlib.sha256(SOURCE.read_bytes()).hexdigest(), "--development"]
+            arguments += ["--upgrade"] if upgrade else ["--enrollment-token", TOKEN]
         environment = dict(self.environment, **(extra_env or {}))
         result = subprocess.run(arguments, env=environment, stdin=subprocess.DEVNULL, capture_output=True,
                                 text=True, timeout=12)
@@ -227,6 +239,91 @@ class InstallerTransactionTests(unittest.TestCase):
         self.assertEqual(foreign.read_text(), "retain")
         self.assertFalse(any(call[0] in ("systemctl", "userdel", "groupdel") for call in self.state()["calls"][before:]))
 
+    def test_upgrade_preserves_v03_vps_credential_config_unit_and_account(self):
+        self.assertEqual(self.run_installer().returncode, 0)
+        previous = SOURCE.read_bytes() + b"\n# v03 installed code fixture\n"
+        self.app.joinpath("agent.py").write_bytes(previous)
+        config = self.config.joinpath("config.json").read_bytes()
+        unit = self.unit.read_bytes()
+        before = len(self.state()["calls"])
+        result = self.run_installer(upgrade=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.app.joinpath("agent.py").read_bytes(), SOURCE.read_bytes())
+        self.assertEqual(self.config.joinpath("config.json").read_bytes(), config)
+        self.assertEqual(self.unit.read_bytes(), unit)
+        self.assertEqual(len(self.api_calls), 1)
+        self.assertTrue(self.state()["active"])
+        self.assertFalse(any(call[0] in ("apt-get", "useradd", "groupadd", "userdel", "groupdel") for call in self.state()["calls"][before:]))
+        self.assertEqual(sorted(path.name for path in self.app.iterdir()), [".managed", "agent.py"])
+        self.assertEqual(list(self.base.joinpath("work").iterdir()), [])
 
+    def test_upgrade_restart_failure_or_failed_health_restores_code_and_registration(self):
+        self.assertEqual(self.run_installer().returncode, 0)
+        old = SOURCE.read_bytes() + b"\n# old code kept after failure\n"
+        self.app.joinpath("agent.py").write_bytes(old)
+        config = self.config.joinpath("config.json").read_bytes()
+        for failure in ("AGENT_TEST_FAIL_UPGRADE", "AGENT_TEST_UPGRADE_INACTIVE"):
+            with self.subTest(failure=failure):
+                state = self.state()
+                state["restarts"] = 0
+                self.state_path.write_text(json.dumps(state))
+                result = self.run_installer(upgrade=True, extra_env={failure: "1"})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.app.joinpath("agent.py").read_bytes(), old)
+                self.assertEqual(self.config.joinpath("config.json").read_bytes(), config)
+                self.assertTrue(self.state()["active"])
+                self.assertEqual(self.state()["restarts"], 2)
+                self.assertEqual(len(self.api_calls), 1)
+                self.assertEqual(sorted(path.name for path in self.app.iterdir()), [".managed", "agent.py"])
+                self.assertEqual(list(self.base.joinpath("work").iterdir()), [])
+
+    def test_upgrade_rejects_checksum_foreign_server_and_probe_config_before_replacement(self):
+        self.assertEqual(self.run_installer().returncode, 0)
+        old = self.app.joinpath("agent.py").read_bytes() + b"\n# unchanged\n"
+        self.app.joinpath("agent.py").write_bytes(old)
+        path = self.config / "config.json"
+        original = path.read_bytes()
+        for change in ("checksum", "server", "probe"):
+            with self.subTest(change=change):
+                if change == "probe":
+                    value = json.loads(original)
+                    value["role"] = "probe"
+                    path.write_text(json.dumps(value))
+                before = len(self.state()["calls"])
+                result = self.run_installer(upgrade=True,
+                    extra_env={"AGENT_TEST_BAD_SHA": "1"} if change == "checksum" else None,
+                    server="http://127.0.0.1:1" if change == "server" else None)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.app.joinpath("agent.py").read_bytes(), old)
+                self.assertFalse(any(call[0] == "systemctl" and call[1] in ("restart", "stop") for call in self.state()["calls"][before:]))
+                self.assertEqual(len(self.api_calls), 1)
+                path.write_bytes(original)
+
+    def test_upgrade_requires_unchanged_owned_markers_unit_and_no_unexpected_data(self):
+        self.assertEqual(self.run_installer().returncode, 0)
+        for path in (self.app / ".managed", self.unit, self.config / "foreign.json"):
+            with self.subTest(path=path):
+                original = path.read_bytes() if path.exists() else None
+                path.write_bytes((original or b"") + b"foreign data\n")
+                before = len(self.state()["calls"])
+                result = self.run_installer(upgrade=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(any(call[0] in ("curl", "apt-get", "systemctl") for call in self.state()["calls"][before:]))
+                if original is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(original)
+
+    def test_upgrade_rejects_group_writable_owned_path_before_download(self):
+        self.assertEqual(self.run_installer().returncode, 0)
+        for path in (self.app, self.config / "config.json", self.unit):
+            with self.subTest(path=path):
+                previous = path.stat().st_mode & 0o777
+                path.chmod(previous | 0o020)
+                before = len(self.state()["calls"])
+                result = self.run_installer(upgrade=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(any(call[0] in ("curl", "systemctl") for call in self.state()["calls"][before:]))
+                path.chmod(previous)
 if __name__ == "__main__":
     unittest.main()

@@ -129,8 +129,9 @@ class BackendCase(unittest.TestCase):
         body.update(changes)
         return self.app.save_monitor(body)
 
-    def probe(self, name="测试节点"):
-        return self.app.save_fleet("nodes", {"name": name, "region": "测试区", "enabled": True})
+    def probe(self, name="测试目标", address="8.8.8.8", protocol="ICMP", port=None):
+        return self.app.save_fleet("nodes", {"name": name, "region": "测试区", "enabled": True,
+                                              "address": address, "protocol": protocol, "port": port})
 
     def host_item(self, nodes):
         return self.app.save_fleet("hosts", {"name": "VPS", "region": "测试区", "address": "8.8.8.8", "enabled": True, "nodeIds": nodes})
@@ -139,16 +140,17 @@ class BackendCase(unittest.TestCase):
         info = self.app.enrollment(role, object_id, "https://watch.example.com")
         args = shlex.split(info["command"])
         token = args[args.index("--enrollment-token") + 1]
-        return self.app.enroll({"token": token})
+        registered = self.app.enroll({"token": token})
+        self.app.heartbeat(registered["credential"], {"agentVersion": 2})
+        return registered
 
     def task(self):
         node = self.probe()
         host = self.host_item([node["id"]])
         vps = self.register("vps", host["id"])
-        probe = self.register("probe", node["id"])
         self.app.queue_host(host["id"])
-        job = self.app.heartbeat(probe["credential"], {})["tasks"][0]
-        return host, node, vps, probe, job
+        job = self.app.heartbeat(vps["credential"], {"agentVersion": 2})["tasks"][0]
+        return host, node, vps, vps, job
 
     def result_body(self, job, **changes):
         body = {"jobId": job["id"], "sent": 5, "received": 4, "avgRttMs": 12.3, "status": "OK"}
@@ -404,10 +406,11 @@ class BackendCase(unittest.TestCase):
 
     def test_enrollment_one_time_expiry_regeneration_and_sha_command(self):
         node = self.probe()
-        first = self.app.enrollment("probe", node["id"], "https://watch.example.com")
+        host = self.host_item([node["id"]])
+        first = self.app.enrollment("vps", host["id"], "https://watch.example.com")
         first_args = shlex.split(first["command"])
         first_token = first_args[first_args.index("--enrollment-token") + 1]
-        second = self.app.enrollment("probe", node["id"], "https://watch.example.com")
+        second = self.app.enrollment("vps", host["id"], "https://watch.example.com")
         args = shlex.split(second["command"])
         token = args[args.index("--enrollment-token") + 1]
         self.assertIn("-fsS", args)
@@ -416,23 +419,24 @@ class BackendCase(unittest.TestCase):
         self.assertEqual(args[args.index("--agent-sha") + 1], hashlib.sha256((self.agent_dir / "agent.py").read_bytes()).hexdigest())
         self.assert_api_error(401, self.app.enroll, {"token": first_token})
         registered = self.app.enroll({"token": token})
-        self.assertEqual(registered["role"], "probe")
+        self.assertEqual(registered["role"], "vps")
         self.assert_api_error(401, self.app.enroll, {"token": token})
-        third = self.app.enrollment("probe", node["id"], "https://watch.example.com")
+        third = self.app.enrollment("vps", host["id"], "https://watch.example.com")
         args = shlex.split(third["command"])
         self.now += 601
         self.assert_api_error(401, self.app.enroll, {"token": args[args.index("--enrollment-token") + 1]})
         self.assertNotIn(token, json.dumps(self.app.fleet()))
         self.assertNotIn(registered["credential"], json.dumps(self.app.fleet()))
 
-    def test_agent_vps_no_tasks_and_probe_binding_and_admin_separation(self):
+    def test_agent_vps_tasks_cross_vps_binding_and_admin_separation(self):
         host, node, vps, probe, job = self.task()
-        self.assertEqual(self.app.heartbeat(vps["credential"], {})["tasks"], [])
         self.assertEqual(job["target"], "8.8.8.8")
         self.assertEqual((job["sent"], job["timeoutSeconds"]), (5, 8))
-        other = self.register("probe", self.probe("另一个节点")["id"])
+        self.assertEqual((job["taskVersion"], job["hostId"], job["nodeId"], job["protocol"], job["port"]), (2, host["id"], node["id"], "ICMP", None))
+        other = self.register("vps", self.host_item([node["id"]])["id"])
+        self.assertEqual(self.app.heartbeat(other["credential"], {"agentVersion": 2})["tasks"], [])
         self.assert_api_error(403, self.app.agent_result, other["credential"], self.result_body(job))
-        self.assert_api_error(403, self.app.agent_result, vps["credential"], self.result_body(job))
+        self.assert_api_error(403, self.app.enrollment, "probe", node["id"], "https://watch.example.com")
         self.login()
         status, unused, unused_headers = self.request("PATCH", "/api/vps/%d/enabled" % host["id"], {"enabled": False}, admin=True,
                                                    headers={"Authorization": "Bearer " + probe["credential"]})
@@ -440,7 +444,7 @@ class BackendCase(unittest.TestCase):
 
     def test_job_retry_idempotency_and_no_overwrite(self):
         host, node, unused_vps, probe, job = self.task()
-        repeated = self.app.heartbeat(probe["credential"], {})["tasks"]
+        repeated = self.app.heartbeat(probe["credential"], {"agentVersion": 2})["tasks"]
         self.assertEqual(repeated[0]["id"], job["id"])
         self.assertEqual(self.app.queue_host(host["id"])["count"], 0)
         body = self.result_body(job)
@@ -456,32 +460,28 @@ class BackendCase(unittest.TestCase):
         self.assert_api_error(409, self.app.agent_result, probe["credential"], self.result_body(job))
         self.assertEqual(self.app.fleet()["results"], [])
         self.now += 31
-        self.assertEqual(self.app.fleet_items("nodes", node["id"])["agentState"], "OFFLINE")
+        self.assertEqual(self.app.fleet_items("hosts", host["id"])["agentState"], "OFFLINE")
         self.assert_api_error(409, self.app.queue_host, host["id"])
         self.app.schedule_once()
         self.assertEqual(self.app.history("vps", host["id"], 1, 8)["records"], [])
 
-    def test_offline_registered_vps_can_be_pinged_and_pending_cannot(self):
+    def test_offline_or_pending_vps_cannot_measure_until_v2_heartbeat(self):
         node = self.probe()
         host = self.host_item([node["id"]])
-        probe = self.register("probe", node["id"])
         self.assert_api_error(409, self.app.queue_host, host["id"])
-        self.register("vps", host["id"])
+        vps = self.register("vps", host["id"])
         self.now += 91
-        self.app.heartbeat(probe["credential"], {})
         self.assertEqual(self.app.fleet_items("hosts", host["id"])["agentState"], "OFFLINE")
+        self.assert_api_error(409, self.app.queue_host, host["id"])
+        self.app.heartbeat(vps["credential"], {"agentVersion": 2})
         self.assertEqual(self.app.queue_host(host["id"])["count"], 1)
 
     def test_fleet_timer_only_due_and_heartbeat_max_ten(self):
-        node = self.probe()
-        probe = self.register("probe", node["id"])
-        hosts = []
-        for unused in range(12):
-            host = self.host_item([node["id"]])
-            self.register("vps", host["id"])
-            hosts.append(host)
+        nodes = [self.probe(name="target%d" % index) for index in range(12)]
+        host = self.host_item([node["id"] for node in nodes])
+        probe = self.register("vps", host["id"])
         self.app.schedule_once()
-        self.assertEqual(self.app.heartbeat(probe["credential"], {})["tasks"], [])
+        self.assertEqual(self.app.heartbeat(probe["credential"], {"agentVersion": 2})["tasks"], [])
         self.now += 60
         self.app.schedule_once()
         deadline = time.monotonic() + 3
@@ -492,14 +492,13 @@ class BackendCase(unittest.TestCase):
                 break
             time.sleep(0.01)
         self.assertEqual(queued, 12)
-        tasks = self.app.heartbeat(probe["credential"], {})["tasks"]
+        tasks = self.app.heartbeat(probe["credential"], {"agentVersion": 2})["tasks"]
         self.assertEqual(len(tasks), 10)
         self.assertEqual(len({task["id"] for task in tasks}), 10)
         self.assertEqual(self.app.fleet()["results"], [])
 
-    def test_slow_fleet_dns_does_not_block_http_scheduler_and_queue_is_bounded(self):
+    def test_slow_fleet_queue_does_not_block_http_scheduler_and_queue_is_bounded(self):
         node = self.probe()
-        self.register("probe", node["id"])
         for unused in range(80):
             host = self.host_item([node["id"]])
             self.register("vps", host["id"])
@@ -507,14 +506,13 @@ class BackendCase(unittest.TestCase):
         self.now += 60
         release = threading.Event()
         started = threading.Event()
-        original = server.resolve_target
+        original = self.app.queue_host
         def slow_fleet(host, *args, **kwargs):
-            if host == "8.8.8.8":
-                started.set()
-                release.wait(3)
+            started.set()
+            release.wait(3)
             return original(host, *args, **kwargs)
         try:
-            with patch.object(server, "resolve_target", slow_fleet):
+            with patch.object(self.app, "queue_host", slow_fleet):
                 start = time.monotonic()
                 self.app.schedule_once()
                 self.app.schedule_once()
@@ -545,43 +543,138 @@ class BackendCase(unittest.TestCase):
         saved = self.app.history("vps", host["id"], 1, 8)["records"][0]
         self.assertEqual((saved["sent"], saved["received"], saved["avgRttMs"], saved["status"]), (0, 0, None, "ERROR"))
         self.app.queue_host(host["id"])
-        timeout_job = self.app.heartbeat(probe["credential"], {})["tasks"][0]
+        timeout_job = self.app.heartbeat(probe["credential"], {"agentVersion": 2})["tasks"][0]
         self.app.agent_result(probe["credential"], self.result_body(timeout_job, status="TIMEOUT", received=0, avgRttMs=None))
         self.assertEqual(self.app.history("vps", host["id"], 1, 8)["total"], 2)
 
     def test_reenrollment_revokes_old_credential_and_lease(self):
         host, node, unused_vps, probe, job = self.task()
-        fresh = self.register("probe", node["id"])
+        fresh = self.register("vps", host["id"])
         self.assert_api_error(401, self.app.heartbeat, probe["credential"], {})
         self.assert_api_error(401, self.app.agent_result, probe["credential"], self.result_body(job))
         self.assert_api_error(403, self.app.agent_result, fresh["credential"], self.result_body(job))
-        self.assertEqual(self.app.heartbeat(fresh["credential"], {})["tasks"], [])
+        self.assertEqual(self.app.heartbeat(fresh["credential"], {"agentVersion": 2})["tasks"], [])
 
-    def test_node_delete_keeps_snapshot_host_address_change_clears_results(self):
+    def test_target_delete_and_host_display_address_change_keep_snapshot_history(self):
         host, node, unused_vps, probe, job = self.task()
         self.app.agent_result(probe["credential"], self.result_body(job))
         self.app.remove("nodes", node["id"])
         self.assertEqual(self.app.fleet_items("hosts", host["id"])["nodeIds"], [])
         saved = self.app.history("vps", host["id"], 1, 8)["records"][0]
         self.assertEqual(saved["nodeName"], node["name"])
-        self.assert_api_error(401, self.app.heartbeat, probe["credential"], {})
+        self.assertEqual(self.app.heartbeat(probe["credential"], {"agentVersion": 2})["tasks"], [])
         self.app.save_fleet("hosts", {"name": "VPS", "region": "", "enabled": True, "address": "1.1.1.1", "nodeIds": []}, host["id"])
-        self.assertEqual(self.app.history("vps", host["id"], 1, 8)["records"], [])
+        self.assertEqual(self.app.history("vps", host["id"], 1, 8)["total"], 1)
 
     def test_enrollment_http_production_rejected_dev_and_assets_work(self):
         self.login()
         node = self.probe()
+        host = self.host_item([node["id"]])
         self.app.allow_private = False
-        status, unused, unused_headers = self.request("POST", "/api/probes/%d/enrollment" % node["id"], admin=True)
+        status, unused, unused_headers = self.request("POST", "/api/vps/%d/enrollment" % host["id"], admin=True)
         self.assertEqual(status, 403)
         self.app.allow_private = True
-        status, content, unused = self.request("POST", "/api/probes/%d/enrollment" % node["id"], admin=True)
+        status, content, unused = self.request("POST", "/api/vps/%d/enrollment" % host["id"], admin=True)
         self.assertEqual(status, 200)
         self.assertIn("--development", content["data"]["command"])
         source = self.request("GET", "/agent/agent.py")[1]
         checksum = self.request("GET", "/agent/agent.py.sha256")[1]
         self.assertEqual(checksum.decode().split()[0], hashlib.sha256(source).hexdigest())
         self.assertEqual(self.request("GET", "/agent/agent.py?sha=" + "0" * 64)[0], 409)
+
+    def test_target_config_accepts_tcp_domain_and_ipv6_but_rejects_invalid_ports(self):
+        target = self.probe(address="hb-ct-v4.ip.zstaticcdn.com:80", protocol="TCP")
+        self.assertEqual((target["address"], target["protocol"], target["port"]), ("hb-ct-v4.ip.zstaticcdn.com", "TCP", 80))
+        self.assertFalse(target["needsConfiguration"])
+        self.assertNotIn("agentState", target)
+        self.assertNotIn("lastSeenAt", target)
+        ipv6 = self.probe(address="[2001:4860:4860::8888]:443", protocol="TCP")
+        self.assertEqual((ipv6["address"], ipv6["port"]), ("2001:4860:4860::8888", 443))
+        for changes in ({"protocol": "UDP"}, {"protocol": "TCP", "port": None}, {"port": 80},
+                        {"protocol": "TCP", "port": True}, {"protocol": "TCP", "port": 0},
+                        {"protocol": "TCP", "port": 65536}, {"protocol": "TCP", "address": "example.com:80", "port": 443},
+                        {"protocol": "TCP", "address": "example.com:1", "port": True},
+                        {"protocol": "TCP", "address": "example.com:80", "port": 80.0},
+                        {"address": "https://example.com"}, {"address": "user@example.com"}):
+            body = {"name": "target", "region": "", "enabled": True, "address": "8.8.8.8", "protocol": "ICMP", "port": None}
+            body.update(changes)
+            self.assert_api_error(400, self.app.save_fleet, "nodes", body)
+        self.app.allow_private = False
+        for address in ("127.0.0.1", "169.254.169.254", "192.168.1.1", "::1", "::ffff:127.0.0.1"):
+            self.assert_api_error(400, self.app.save_fleet, "nodes", {"name": "target", "region": "", "enabled": True,
+                                                                      "address": address, "protocol": "ICMP", "port": None})
+        with patch.object(server, "resolve_target", side_effect=AssertionError("metadata/target DNS must not run on control server")):
+            target = self.probe(address="unresolvable.example", protocol="TCP", port=80)
+            host = self.app.save_fleet("hosts", {"name": "private metadata", "region": "", "address": "192.168.1.8", "enabled": True, "nodeIds": [target["id"]]})
+            vps = self.register("vps", host["id"])
+            self.assertEqual(self.app.queue_host(host["id"])["count"], 1)
+            self.assertEqual(self.app.heartbeat(vps["credential"], {"agentVersion": 2})["tasks"][0]["target"], "unresolvable.example")
+
+    def test_tcp_result_snapshot_edit_cancels_jobs_and_filters_latest(self):
+        target = self.probe(address="hb-ct-v4.ip.zstaticcdn.com", protocol="TCP", port=80)
+        host = self.host_item([target["id"]])
+        vps = self.register("vps", host["id"])
+        self.app.queue_host(host["id"])
+        job = self.app.heartbeat(vps["credential"], {"agentVersion": 2})["tasks"][0]
+        self.assertEqual((job["target"], job["protocol"], job["port"]), (target["address"], "TCP", 80))
+        self.app.agent_result(vps["credential"], self.result_body(job))
+        first = self.app.fleet()["results"][0]
+        self.assertEqual((first["direction"], first["protocol"], first["targetAddress"], first["targetPort"]), ("VPS_TO_TARGET", "TCP", target["address"], 80))
+        self.app.queue_host(host["id"])
+        old_job = self.app.heartbeat(vps["credential"], {"agentVersion": 2})["tasks"][0]
+        self.app.save_fleet("nodes", {"name": "renamed", "region": "new", "address": "1.1.1.1", "protocol": "ICMP", "port": None, "enabled": True}, target["id"])
+        self.assert_api_error(409, self.app.agent_result, vps["credential"], self.result_body(old_job))
+        self.assertEqual(self.app.fleet()["results"], [])
+        snapshot = self.app.history("vps", host["id"], 1, 8)["records"][0]
+        self.assertEqual(snapshot, first)
+        self.app.queue_host(host["id"])
+        new_job = self.app.heartbeat(vps["credential"], {"agentVersion": 2})["tasks"][0]
+        self.assertEqual((new_job["target"], new_job["protocol"], new_job["port"]), ("1.1.1.1", "ICMP", None))
+        self.app.agent_result(vps["credential"], self.result_body(new_job, status="TIMEOUT", received=0, avgRttMs=None))
+        self.assertEqual(self.app.fleet()["results"][0]["nodeName"], "renamed")
+        self.assertEqual(self.app.history("vps", host["id"], 1, 8)["total"], 2)
+
+    def test_legacy_heartbeat_requires_upgrade_and_never_receives_tasks(self):
+        host, target, vps, unused, job = self.task()
+        old = self.app.heartbeat(vps["credential"], {})
+        self.assertEqual(old["tasks"], [])
+        self.assertTrue(old["agentUpdateRequired"])
+        self.assertEqual(old["requiredAgentVersion"], 2)
+        model = self.app.fleet_items("hosts", host["id"])
+        self.assertEqual((model["agentVersion"], model["agentState"]), (1, "ONLINE"))
+        self.assertTrue(model["agentUpdateRequired"])
+        self.assert_api_error(409, self.app.queue_host, host["id"])
+        self.assert_api_error(409, self.app.agent_result, vps["credential"], self.result_body(job))
+        for body in ({"agentVersion": True}, {"agentVersion": 3}, {"agentVersion": None}, {"extra": 2}):
+            self.assert_api_error(400, self.app.heartbeat, vps["credential"], body)
+        self.assertFalse(self.app.heartbeat(vps["credential"], {"agentVersion": 2})["agentUpdateRequired"])
+        self.assertEqual(self.app.queue_host(host["id"])["count"], 1)
+        self.assertEqual(self.request("GET", "/api/health")[1]["data"]["dataSchema"], 2)
+
+    def test_disable_or_remove_association_cancels_leased_jobs(self):
+        host, target, vps, unused, job = self.task()
+        self.app.enable("nodes", target["id"], {"enabled": False})
+        self.assert_api_error(409, self.app.agent_result, vps["credential"], self.result_body(job))
+        self.assert_api_error(409, self.app.queue_host, host["id"])
+        self.app.enable("nodes", target["id"], {"enabled": True})
+        self.app.queue_host(host["id"])
+        other_job = self.app.heartbeat(vps["credential"], {"agentVersion": 2})["tasks"][0]
+        self.app.save_fleet("hosts", {"name": host["name"], "address": host["address"], "region": "", "enabled": True, "nodeIds": []}, host["id"])
+        self.assert_api_error(409, self.app.agent_result, vps["credential"], self.result_body(other_job))
+        self.assertEqual(self.app.history("vps", host["id"], 1, 8)["total"], 0)
+
+    def test_target_has_no_enrollment_and_vps_upgrade_command_has_no_token(self):
+        self.login()
+        target = self.probe()
+        self.assertEqual(self.request("POST", "/api/probes/%d/enrollment" % target["id"], {}, admin=True)[0], 403)
+        host = self.host_item([target["id"]])
+        data = self.request("POST", "/api/vps/%d/enrollment" % host["id"], {}, admin=True)[1]["data"]
+        upgrade = shlex.split(data["upgradeCommand"])
+        self.assertIn("--upgrade", upgrade)
+        self.assertNotIn("--enrollment-token", upgrade)
+        self.assertIn("--agent-sha", upgrade)
+        self.assertIn("--development", upgrade)
+        self.assertNotEqual(data["upgradeCommand"], data["command"])
 
 
 class TLSCase(unittest.TestCase):

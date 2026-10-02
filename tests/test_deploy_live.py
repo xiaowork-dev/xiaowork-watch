@@ -18,9 +18,9 @@ runtime = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(runtime)
 
 
-def live_archive(sha):
+def live_archive(sha, data_schema=2):
     return archive_bytes(sha, extra={
-        'release.json': json.dumps({'schema': 1, 'kind': 'monitoring-server', 'version': '0.3.0', 'commit': sha}).encode(),
+        'release.json': json.dumps({'schema': 1, 'kind': 'monitoring-server', 'version': '0.4.0', 'dataSchema': data_schema, 'commit': sha}).encode(),
         '.deploy/console.py': b'# console\n', '.deploy/runtime.py': b'# runtime\n',
         '.backend/server.py': b'# backend\n', '.agent/agent.py': b'# agent\n', '.agent/install.sh': b'#!/bin/bash\n',
     })
@@ -33,6 +33,68 @@ class LiveUpgradeTests(unittest.TestCase):
     fetcher = legacy.DeploymentTests.fetcher
     require_symlinks = legacy.DeploymentTests.require_symlinks
     deploy = legacy.DeploymentTests.deploy
+
+    def runtime_mock(self):
+        module = Mock()
+        module.api_port.return_value = 8091
+        module.Activation.return_value = Mock()
+        return module
+
+    def test_schema_upgrade_keeps_previous_but_blocks_incompatible_rollback(self):
+        import test_deploy_manage
+        with patch.object(test_deploy_manage.manage, '_runtime', return_value=self.runtime_mock()):
+            self.deploy(SHA_A, archive=live_archive(SHA_A, data_schema=1))
+            self.deploy(SHA_B, archive=live_archive(SHA_B, data_schema=2))
+            with self.assertRaisesRegex(Exception, '旧数据结构'):
+                self.manager.rollback()
+        self.assertEqual(self.manager.status()['current'], SHA_B)
+        self.assertEqual(self.manager.status()['previous'], SHA_A)
+
+    def test_same_schema_rollback_still_switches_both_components(self):
+        import test_deploy_manage
+        module = self.runtime_mock()
+        with patch.object(test_deploy_manage.manage, '_runtime', return_value=module):
+            self.deploy(SHA_A, archive=live_archive(SHA_A))
+            self.deploy(SHA_B, archive=live_archive(SHA_B))
+            module.Activation.reset_mock()
+            self.manager.rollback()
+            module.Activation.assert_called_once()
+        self.assertEqual(self.manager.status()['current'], SHA_A)
+        self.assertFalse(self.manager._config()['autoUpdate'])
+
+    def test_unknown_data_schema_rejected_before_runtime_activation(self):
+        self.require_symlinks()
+        import test_deploy_manage
+        with patch.object(test_deploy_manage.manage, '_runtime') as runtime_loader:
+            with self.assertRaisesRegex(Exception, 'unsupported data schema'):
+                self.deploy(SHA_A, archive=live_archive(SHA_A, data_schema=99))
+            runtime_loader.assert_not_called()
+
+    def test_commit_failure_restores_previous_installation_record(self):
+        import test_deploy_manage
+        module = self.runtime_mock()
+        with patch.object(test_deploy_manage.manage, '_runtime', return_value=module):
+            self.deploy(SHA_A, archive=live_archive(SHA_A))
+            old_record = json.loads((self.root / 'installed.json').read_text())
+            old_config = self.manager._config()
+            module.Activation.return_value.commit.side_effect = ValueError('gate could not open')
+            with self.assertRaisesRegex(ValueError, 'gate could not open'):
+                self.deploy(SHA_B, archive=live_archive(SHA_B))
+            module.Activation.return_value.restore.assert_called_once()
+        self.assertEqual(json.loads((self.root / 'installed.json').read_text()), old_record)
+        self.assertEqual(self.manager._config(), old_config)
+        self.assertEqual(self.manager.status()['current'], SHA_A)
+
+    def test_first_install_commit_failure_leaves_no_success_record(self):
+        import test_deploy_manage
+        module = self.runtime_mock()
+        module.Activation.return_value.commit.side_effect = ValueError('gate could not open')
+        with patch.object(test_deploy_manage.manage, '_runtime', return_value=module):
+            with self.assertRaisesRegex(ValueError, 'gate could not open'):
+                self.deploy(SHA_A, archive=live_archive(SHA_A))
+        self.assertFalse((self.root / 'installed.json').exists())
+        self.assertIsNone(self.manager.status()['current'])
+
     def test_live_upgrade_runs_runtime_and_keeps_legacy_previous(self):
         self.deploy(SHA_A)
         state = Mock()
@@ -42,7 +104,7 @@ class LiveUpgradeTests(unittest.TestCase):
         import test_deploy_manage
         with patch.object(test_deploy_manage.manage, '_runtime', return_value=module):
             self.deploy(SHA_B, archive=live_archive(SHA_B))
-        self.assertEqual([x[0] for x in state.method_calls], ['prepare', 'start'])
+        self.assertEqual([x[0] for x in state.method_calls], ['prepare', 'start', 'commit'])
         self.assertEqual(self.manager.status()['kind'], 'monitoring-server')
         self.assertEqual(self.manager.status()['previous'], SHA_A)
         self.assertTrue(self.manager._config()['backendEnabled'])
@@ -83,6 +145,9 @@ class RuntimeConfigurationTests(unittest.TestCase):
         activation = runtime.Activation.__new__(runtime.Activation)
         activation.snapshots = {site: 'old site', proxy: 'old TLS proxy', service: None}
         activation.changed = True
+        activation.committed = activation.stop_attempted = activation.marker_active = False
+        activation.recovery_blocked = False
+        activation.backup = None
         activation.start_attempted = started
         activation.units_touched = started
         activation.was_active = activation.was_enabled = False

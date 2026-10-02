@@ -1,9 +1,14 @@
 """Managed Python/SQLite runtime. Called only for monitoring-server packages."""
 import json
+import contextlib
 import os
 from pathlib import Path
 import re
+import secrets
+import sqlite3
+import stat
 import subprocess
+import tempfile
 import time
 from urllib.request import Request, build_opener, ProxyHandler, HTTPRedirectHandler
 from urllib.parse import urlsplit
@@ -147,6 +152,9 @@ class Activation:
         if os.name != "posix" or os.geteuid() != 0:
             raise ValueError("真实主控安装需要 Ubuntu/Debian 的 root 权限。")
         self.root, self.release, self.port = manager.root, release, api_port(config)
+        self.original_release = manager._pointed_sha('current')
+        self.target_schema = json.loads((release / 'release.json').read_text(encoding='utf-8')).get('dataSchema', 1)
+        self.owner_uid = os.geteuid()
         self.config = dict(config)
         self.domains = [config.get('proxyDomain'), config.get('tlsDomain')]
         if self.root == Path('/root') or Path('/root') in self.root.parents or self.root == Path('/home') or Path('/home') in self.root.parents:
@@ -166,9 +174,181 @@ class Activation:
         self.changed = False
         self.start_attempted = False
         self.units_touched = False
+        self.stop_attempted = False
+        self.marker_active = False
+        self.committed = False
+        self.backup = None
+        self.directory = None
+        self.recovery_blocked = False
+
+    def _inactive(self):
+        run(["systemctl", "stop", SERVICE_NAME])
+        state = run(["systemctl", "show", SERVICE_NAME, "--property=ActiveState", "--value"]).strip()
+        if state not in ('inactive', 'failed'):
+            raise ValueError("主控服务尚未停止，未修改数据库。")
+
+    def _database_schema(self, path):
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("数据库或恢复备份路径不安全。")
+        try:
+            with contextlib.closing(sqlite3.connect(str(path), timeout=10)) as database:
+                return database.execute('PRAGMA user_version').fetchone()[0]
+        except sqlite3.Error as error:
+            raise ValueError("数据库版本检查失败。") from error
+
+    def _marker_read(self):
+        path = self.directory / '.activation-in-progress'
+        info = path.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != self.owner_uid
+                or (os.name == 'posix' and stat.S_IMODE(info.st_mode) != 0o600) or info.st_size > 8192):
+            raise ValueError("遗留升级标记归属或权限无效，已停止。")
+        value = json.loads(path.read_text(encoding='utf-8'))
+        if (not isinstance(value, dict) or type(value.get('schema')) is not int or value['schema'] != 1 or value.get('root') != str(self.root)
+                or type(value.get('databaseSchema')) is not int or value['databaseSchema'] not in (0, 1, 2)
+                or type(value.get('targetSchema')) is not int or value['targetSchema'] not in (1, 2)
+                or not isinstance(value.get('target'), str) or not re.fullmatch(r'[a-f0-9]{40}', value['target'])
+                or (value.get('current') is not None and (not isinstance(value['current'], str) or not re.fullmatch(r'[a-f0-9]{40}', value['current'])))
+                or (value.get('backup') is not None and (not isinstance(value['backup'], str) or not re.fullmatch(r'watch\.activation-schema[012]-[a-f0-9]{24}\.sqlite3', value['backup'])))):
+            raise ValueError("遗留升级标记内容无效，已保留供恢复。")
+        return value
+
+    def _marker_write(self, value):
+        descriptor, name = tempfile.mkstemp(prefix='.activation-', dir=str(self.directory))
+        try:
+            with os.fdopen(descriptor, 'w', encoding='utf-8') as output:
+                json.dump(value, output, sort_keys=True)
+                output.flush()
+                os.fsync(output.fileno())
+            os.chmod(name, 0o600)
+            os.replace(name, self.directory / '.activation-in-progress')
+            self.journal = value
+            self.marker_active = True
+            self._sync_data_directory()
+        finally:
+            if os.path.exists(name):
+                os.unlink(name)
+
+    def _sync_data_directory(self):
+        if os.name == 'posix':
+            descriptor = os.open(str(self.directory), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
+    def _snapshot_database(self, schema):
+        backup = self.directory / ('watch.activation-schema' + str(schema) + '-' + secrets.token_hex(12) + '.sqlite3')
+        descriptor = os.open(str(backup), os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        os.close(descriptor)
+        try:
+            self._copy_database(self.directory / 'watch.sqlite3', backup)
+            if self._database_schema(backup) != schema:
+                raise ValueError("升级前数据库快照版本不一致。")
+            return backup
+        except BaseException:
+            backup.unlink()
+            raise
+
+    def _copy_database(self, source, destination):
+        deadline = time.monotonic() + 10
+        def bounded(unused_status, unused_remaining, unused_total):
+            if time.monotonic() > deadline:
+                raise ValueError("数据库备份超过时限。")
+        try:
+            with contextlib.closing(sqlite3.connect(str(source), timeout=10)) as original:
+                with contextlib.closing(sqlite3.connect(str(destination), timeout=10)) as copied:
+                    original.backup(copied, pages=128, progress=bounded, sleep=0.05)
+                    if copied.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
+                        raise ValueError("数据库备份完整性检查失败。")
+        except sqlite3.Error as error:
+            raise ValueError("数据库备份或恢复失败。") from error
+        os.chmod(str(destination), 0o600)
+        descriptor = os.open(str(destination), os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _backup_valid(self, backup):
+        info = backup.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != self.owner_uid
+                or (os.name == 'posix' and stat.S_IMODE(info.st_mode) != 0o600)):
+            raise ValueError("恢复备份归属或权限无效。")
+
+    def _restore_database(self, backup):
+        self._backup_valid(backup)
+        destination = self.directory / 'watch.sqlite3'
+        if destination.is_symlink() or not destination.is_file():
+            raise ValueError("数据库恢复目标不安全。")
+        owner = destination.stat()
+        descriptor, name = tempfile.mkstemp(prefix='.restore-database-', dir=str(self.directory))
+        os.close(descriptor)
+        staged = Path(name)
+        try:
+            self._copy_database(backup, staged)
+            if os.name == 'posix':
+                os.chown(str(staged), owner.st_uid, owner.st_gid)
+            for suffix in ('-wal', '-shm'):
+                sidecar = destination.with_name(destination.name + suffix)
+                if sidecar.is_symlink() or (sidecar.exists() and not sidecar.is_file()):
+                    raise ValueError("数据库 WAL/SHM 文件不安全。")
+                if sidecar.exists():
+                    sidecar.unlink()
+            os.replace(str(staged), str(destination))
+            self._sync_data_directory()
+        finally:
+            if staged.exists():
+                staged.unlink()
+
+    def _current_schema(self):
+        if self.original_release is None:
+            return None
+        metadata = json.loads((self.root / 'releases' / self.original_release / 'release.json').read_text(encoding='utf-8'))
+        return metadata.get('dataSchema', 1) if metadata.get('kind') == 'monitoring-server' else None
+
+    def _database_prepare(self):
+        marker = self.directory / '.activation-in-progress'
+        database = self.directory / 'watch.sqlite3'
+        current_schema = self._current_schema()
+        self.recovery_blocked = current_schema is not None
+        existed = database.exists()
+        if not existed and current_schema is not None and self.snapshots[SERVICE] is not None:
+            raise ValueError("已有主控数据库缺失，已停止升级。")
+        actual = self._database_schema(database) if existed else 0
+        self.recovery_blocked = current_schema is not None and current_schema < actual
+        if marker.exists() or marker.is_symlink():
+            prior = self._marker_read()
+            if self.original_release not in (prior['current'], prior['target']):
+                raise ValueError("遗留升级标记与当前网站版本不一致，已停止。")
+            if actual > self.target_schema:
+                raise ValueError("目标版本不能读取现有数据库，已保留升级标记。")
+            if current_schema is not None and current_schema < actual:
+                if not prior['backup'] or prior['databaseSchema'] > current_schema:
+                    raise ValueError("遗留升级缺少匹配的旧数据库备份，未启动旧服务。")
+                backup = self.directory / prior['backup']
+                self._backup_valid(backup)
+                if self._database_schema(backup) != prior['databaseSchema']:
+                    raise ValueError("遗留数据库备份版本不匹配。")
+                self._restore_database(backup)
+                actual = prior['databaseSchema']
+                self.recovery_blocked = False
+        if actual > self.target_schema:
+            raise ValueError("目标版本不能读取现有数据库。")
+        # v0.3 used SQLite's default user_version=0. An existing database with
+        # that raw version is real legacy data and must be backed up, even when
+        # the old release advertises dataSchema=1. Absence is the fresh case.
+        self.backup = self._snapshot_database(actual) if existed and actual < self.target_schema else None
+        self._marker_write({'schema': 1, 'root': str(self.root), 'current': self.original_release,
+                            'target': self.release.name, 'targetSchema': self.target_schema,
+                            'databaseSchema': actual, 'backup': self.backup.name if self.backup else None})
 
     def prepare(self):
         directory = data_directory(self.root)
+        self.directory = directory
+        if self.snapshots[SERVICE] is not None:
+            self.stop_attempted = True
+            self._inactive()
+        self._database_prepare()
         # Admin is created once and printed only to the local installing terminal.
         run(["runuser", "-u", USER, "--", "/usr/bin/python3", "-B", str(self.release / ".backend/server.py"),
              "--data-dir", str(directory), "--init-admin"], capture=False)
@@ -191,6 +371,15 @@ class Activation:
         self.health(self.release.name)
         run(["systemctl", "reload", "nginx"])
         self.proxy_health(self.release.name)
+
+    def commit(self):
+        # Unlink is the publication boundary. The backend may accept writes as
+        # soon as it succeeds; nothing that can raise follows this operation.
+        if self._marker_read() != self.journal:
+            raise ValueError("升级标记已改变，尚未开放写入。")
+        (self.directory / '.activation-in-progress').unlink()
+        self.marker_active = False
+        self.committed = True
 
     def proxy_health(self, sha):
         endpoint = urlsplit(self.config.get("healthUrl", ""))
@@ -230,7 +419,7 @@ class Activation:
         raise ValueError("主控健康检查失败，更新将恢复原版本。")
 
     def restore(self):
-        if not self.changed:
+        if self.committed or not (self.changed or self.stop_attempted or self.marker_active):
             return
         errors = []
         def recover(arguments):
@@ -242,8 +431,22 @@ class Activation:
                 return False
         # Before start(), a first upgrade has no loaded backend unit. A failed
         # stop must never prevent restoration of the old Nginx configuration.
-        if self.start_attempted:
-            recover(["systemctl", "stop", SERVICE_NAME])
+        stopped = True
+        if self.start_attempted or self.stop_attempted:
+            try:
+                self._inactive()
+            except Exception as error:
+                errors.append(str(error))
+                stopped = False
+        database_restored = stopped and not self.recovery_blocked
+        if self.recovery_blocked:
+            errors.append("现有数据库与旧版本不兼容，未启动旧服务；升级标记及备份已保留。")
+        if self.backup is not None and stopped:
+            try:
+                self._restore_database(self.backup)
+            except Exception as error:
+                errors.append("数据库恢复失败；备份保留在 " + str(self.backup) + ": " + str(error))
+                database_restored = False
         if self.snapshots[SERVICE] is None and self.units_touched:
             recover(["systemctl", "disable", SERVICE_NAME])
         for path, text in self.snapshots.items():
@@ -255,10 +458,18 @@ class Activation:
                     write(path, text)
             except Exception as error:
                 errors.append(str(error))
-        recover(["systemctl", "daemon-reload"])
+        reloaded = recover(["systemctl", "daemon-reload"])
+        if database_restored and reloaded and not errors and self.marker_active:
+            try:
+                if self._marker_read() != self.journal:
+                    raise ValueError("升级标记已改变，未清除。")
+                (self.directory / '.activation-in-progress').unlink()
+                self.marker_active = False
+            except Exception as error:
+                errors.append(str(error))
         if self.snapshots[SERVICE] is not None:
             recover(["systemctl", "enable" if self.was_enabled else "disable", SERVICE_NAME])
-            if self.was_active and self.start_attempted:
+            if self.was_active and (self.start_attempted or self.stop_attempted) and database_restored and not errors:
                 recover(["systemctl", "start", SERVICE_NAME])
         if recover(["nginx", "-t"]):
             recover(["systemctl", "reload", "nginx"])

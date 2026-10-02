@@ -28,7 +28,10 @@ def package(project, output, commit):
     version = json.loads((project / 'package.json').read_text(encoding='utf-8'))['version']
     live = (project / 'backend/server.py').is_file()
     kind = 'monitoring-server' if live else 'frontend-prototype'
-    files['release.json'] = (json.dumps({'schema': 1, 'kind': kind, 'commit': commit, 'version': version}, sort_keys=True) + '\n').encode()
+    metadata = {'schema': 1, 'kind': kind, 'commit': commit, 'version': version}
+    if live:
+        metadata['dataSchema'] = 2
+    files['release.json'] = (json.dumps(metadata, sort_keys=True) + '\n').encode()
     files['.deploy/manage.py'] = (project / 'scripts/deploy/manage.py').read_bytes()
     files['.deploy/console.py'] = (project / 'scripts/deploy/console.py').read_bytes()
     if live:

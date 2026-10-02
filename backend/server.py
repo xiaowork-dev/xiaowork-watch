@@ -38,7 +38,9 @@ else:
     TargetError, check_http, host_name = _network.TargetError, _network.check_http, _network.host_name
     public_ip, resolve_target, url_target = _network.public_ip, _network.resolve_target, _network.url_target
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
+DATA_SCHEMA = 2
+AGENT_VERSION = 2
 COOKIE = "xiaowork_watch_session"
 SESSION_SECONDS = 8 * 3600
 HEARTBEAT_SECONDS = 30
@@ -150,6 +152,91 @@ CREATE INDEX IF NOT EXISTS pair_history ON fleet_results(host_id,node_id,id DESC
 """
 
 
+def _backup_database(database):
+    """Take a private, consistent committed snapshot before any legacy mutation."""
+    target = database.with_name("watch.schema1-before-v2." + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "." + secrets.token_hex(6) + ".sqlite3")
+    descriptor = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    os.close(descriptor)
+    try:
+        with contextlib.closing(sqlite3.connect(str(database), timeout=10)) as source:
+            with contextlib.closing(sqlite3.connect(str(target), timeout=10)) as backup:
+                source.backup(backup)
+                if backup.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                    raise ValueError("Database backup integrity check failed")
+        os.chmod(str(target), 0o600)
+        descriptor = os.open(str(target), os.O_RDWR | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        if os.name == "posix":
+            descriptor = os.open(str(target.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        return target
+    except BaseException:
+        target.unlink()
+        raise
+
+
+def _apply_schema2(db):
+    # These additive changes run inside one BEGIN IMMEDIATE transaction.
+    for sql in (
+        "ALTER TABLE hosts ADD COLUMN agent_version INTEGER",
+        "ALTER TABLE nodes ADD COLUMN address TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE nodes ADD COLUMN protocol TEXT NOT NULL DEFAULT 'ICMP'",
+        "ALTER TABLE nodes ADD COLUMN port INTEGER",
+        "ALTER TABLE nodes ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE nodes ADD COLUMN needs_configuration INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE jobs ADD COLUMN node_revision INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE jobs ADD COLUMN protocol TEXT NOT NULL DEFAULT 'ICMP'",
+        "ALTER TABLE jobs ADD COLUMN port INTEGER",
+        "ALTER TABLE jobs ADD COLUMN task_version INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE fleet_results ADD COLUMN direction TEXT NOT NULL DEFAULT 'NODE_TO_VPS'",
+        "ALTER TABLE fleet_results ADD COLUMN protocol TEXT NOT NULL DEFAULT 'ICMP'",
+        "ALTER TABLE fleet_results ADD COLUMN target_address TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE fleet_results ADD COLUMN target_port INTEGER",
+        "ALTER TABLE fleet_results ADD COLUMN node_revision INTEGER NOT NULL DEFAULT 1",
+    ):
+        db.execute(sql)
+    # v0.3 histories lacked an address snapshot. Use the old issued job when
+    # retained; an absent job means unknown, never infer a past IP from metadata.
+    db.execute("UPDATE fleet_results SET target_address=COALESCE((SELECT target FROM jobs WHERE jobs.id=fleet_results.job_id),'')")
+    db.execute("UPDATE nodes SET enabled=0,credential_hash=NULL,last_seen=NULL")
+    db.execute("DELETE FROM enrollments WHERE role='probe'")
+    db.execute("UPDATE jobs SET state='cancelled' WHERE state IN ('queued','leased')")
+    db.execute("PRAGMA user_version=2")
+
+
+def _initialize_database(db, database):
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        version = db.execute("PRAGMA user_version").fetchone()[0]
+        if version > DATA_SCHEMA:
+            raise ValueError("Database schema is newer than this backend; refusing to open it")
+        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+        if version == DATA_SCHEMA:
+            if not {"admin", "sessions", "monitors", "monitor_checks", "hosts", "nodes", "associations", "enrollments", "jobs", "fleet_results"}.issubset(tables):
+                raise ValueError("Database schema2 is incomplete")
+        else:
+            if tables:
+                expected = {"admin", "sessions", "monitors", "monitor_checks", "hosts", "nodes", "associations", "enrollments", "jobs", "fleet_results"}
+                if not expected.issubset(tables):
+                    raise ValueError("Unrecognized legacy database; refusing automatic migration")
+                _backup_database(database)
+            else:
+                for statement in SCHEMA.split(";"):
+                    if statement.strip():
+                        db.execute(statement)
+            _apply_schema2(db)
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
+
+
 class Application:
     def __init__(self, data_dir, allow_private=False, start_scheduler=True, clock=time.time, agent_dir=None):
         self.data_dir = Path(data_dir).absolute()
@@ -167,8 +254,12 @@ class Application:
         os.chmod(str(database), 0o600)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys=ON")
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.executescript(SCHEMA)
+        try:
+            _initialize_database(self.db, database)
+            self.db.execute("PRAGMA journal_mode=WAL")
+        except BaseException:
+            self.db.close()
+            raise
         for sidecar in (self.data_dir / "watch.sqlite3-wal", self.data_dir / "watch.sqlite3-shm"):
             if sidecar.exists():
                 os.chmod(str(sidecar), 0o600)
@@ -207,6 +298,10 @@ class Application:
         self.fleet_pool.shutdown(wait=True)
         with self.lock:
             self.db.close()
+
+    def in_maintenance(self):
+        marker = self.data_dir / ".activation-in-progress"
+        return marker.exists() or marker.is_symlink()
 
     def init_admin(self, reset=False):
         with self.transaction() as db:
@@ -272,7 +367,6 @@ class Application:
                 resolve_target(hostname, port, self.allow_private)
                 return value
             normalized = host_name(value)
-            resolve_target(normalized, 80, self.allow_private)
             return normalized
         except TargetError as error:
             raise APIError(400, str(error)) from error
@@ -339,7 +433,9 @@ class Application:
         fields(body, {"enabled"}, {"enabled"})
         value = boolean(body["enabled"])
         with self.transaction() as db:
-            self._found(db, table, object_id)
+            existing = self._found(db, table, object_id)
+            if table == "nodes" and value and existing["needs_configuration"]:
+                raise APIError(409, "请先配置测速目标地址和协议。")
             if table == "monitors":
                 db.execute("UPDATE monitors SET enabled=?,revision=revision+1,updated=?,next_due=? WHERE id=?", (value, self.clock(), self.clock(), object_id))
                 return self._monitor_model(self._found(db, table, object_id))
@@ -412,12 +508,15 @@ class Application:
             return {"records": [model(row) for row in rows], "total": total, "page": page, "size": size}
 
     def _fleet_model(self, row, table):
-        registered = row["credential_hash"] is not None
-        result = {"id": row["id"], "name": row["name"], "region": row["region"], "enabled": bool(row["enabled"]),
-                  "agentState": ("ONLINE" if row["last_seen"] is not None and self.clock() - row["last_seen"] <= OFFLINE_SECONDS else "OFFLINE") if registered else "PENDING",
-                  "lastSeenAt": stamp(row["last_seen"])}
+        result = {"id": row["id"], "name": row["name"], "region": row["region"], "enabled": bool(row["enabled"])}
         if table == "hosts":
-            result.update({"address": row["address"], "nodeIds": [item[0] for item in self.db.execute("SELECT node_id FROM associations WHERE host_id=? ORDER BY node_id", (row["id"],))]})
+            registered = row["credential_hash"] is not None
+            result.update({"address": row["address"], "nodeIds": [item[0] for item in self.db.execute("SELECT node_id FROM associations WHERE host_id=? ORDER BY node_id", (row["id"],))],
+                           "agentState": ("ONLINE" if row["last_seen"] is not None and self.clock() - row["last_seen"] <= OFFLINE_SECONDS else "OFFLINE") if registered else "PENDING",
+                           "lastSeenAt": stamp(row["last_seen"]), "agentVersion": row["agent_version"],
+                           "agentUpdateRequired": registered and row["agent_version"] != AGENT_VERSION})
+        else:
+            result.update({"address": row["address"], "protocol": row["protocol"], "port": row["port"], "needsConfiguration": bool(row["needs_configuration"])})
         return result
 
     def fleet_items(self, table, object_id=None):
@@ -428,23 +527,60 @@ class Application:
 
     def _result_model(self, row):
         return {"id": row["id"], "hostId": row["host_id"], "nodeId": row["node_id"], "nodeName": row["node_name"], "region": row["region"],
-                "sent": row["sent"], "received": row["received"], "avgRttMs": row["avg_rtt"], "status": row["status"], "error": row["error"], "checkedAt": stamp(row["checked"])}
+                "sent": row["sent"], "received": row["received"], "avgRttMs": row["avg_rtt"], "status": row["status"], "error": row["error"], "checkedAt": stamp(row["checked"]),
+                "direction": row["direction"], "protocol": row["protocol"], "targetAddress": row["target_address"], "targetPort": row["target_port"]}
 
     def fleet(self):
         with self.lock:
-            rows = self.db.execute("SELECT r.* FROM fleet_results r WHERE r.id=(SELECT max(t.id) FROM fleet_results t WHERE t.host_id=r.host_id AND t.node_id=r.node_id) ORDER BY r.id DESC").fetchall()
+            rows = self.db.execute("SELECT r.* FROM fleet_results r JOIN nodes n ON n.id=r.node_id JOIN hosts h ON h.id=r.host_id WHERE r.direction='VPS_TO_TARGET' AND r.node_revision=n.revision AND r.id=(SELECT max(t.id) FROM fleet_results t WHERE t.host_id=r.host_id AND t.node_id=r.node_id AND t.direction='VPS_TO_TARGET' AND t.node_revision=n.revision) ORDER BY r.id DESC").fetchall()
             return {"hosts": self.fleet_items("hosts"), "nodes": self.fleet_items("nodes"), "results": [self._result_model(row) for row in rows]}
 
+    def _target_input(self, body):
+        protocol = body["protocol"]
+        if protocol not in ("ICMP", "TCP"):
+            raise APIError(400, "测速协议仅支持 ICMP/TCP。")
+        address, port = text(body["address"], "测速地址", 300), body["port"]
+        if protocol == "ICMP" and port is not None:
+            raise APIError(400, "ICMP 目标不能设置端口。")
+        if protocol == "TCP" and port is not None:
+            port = integer(port, "TCP 端口", 1, 65535)
+        try:
+            combined = address.startswith("[") or (protocol == "TCP" and address.count(":") == 1)
+            if combined:
+                parsed = urlsplit("//" + address)
+                if not parsed.hostname or parsed.username is not None or parsed.password is not None or parsed.path or parsed.query or parsed.fragment:
+                    raise ValueError()
+                embedded = parsed.port
+                if embedded is not None:
+                    if protocol == "ICMP" or (port is not None and port != embedded):
+                        raise ValueError()
+                    port = embedded
+                address = parsed.hostname
+            address = host_name(address)
+            try:
+                numeric = ipaddress.ip_address(address)
+            except ValueError:
+                numeric = None
+            if numeric is not None and not self.allow_private and not public_ip(address):
+                raise ValueError()
+        except (ValueError, UnicodeError) as error:
+            raise APIError(400, "测速地址或端口无效；只允许外部域名/公网 IP。") from error
+        if protocol == "TCP":
+            port = integer(port, "TCP 端口", 1, 65535)
+        return address, protocol, port
+
     def save_fleet(self, table, body, object_id=None):
-        allowed = {"name", "region", "enabled"} | ({"address", "nodeIds"} if table == "hosts" else set())
+        allowed = {"name", "region", "enabled"} | ({"address", "nodeIds"} if table == "hosts" else {"address", "protocol", "port"})
         fields(body, allowed, allowed)
         name, region, enabled = text(body["name"], "名称"), text(body["region"], "地区", required=False), boolean(body["enabled"])
         address, node_ids = None, []
         if table == "hosts":
             address = self._target(text(body["address"], "地址", 253))
             if not isinstance(body["nodeIds"], list) or len(body["nodeIds"]) > 100:
-                raise APIError(400, "测试节点选择无效。")
-            node_ids = sorted(set(integer(value, "测试节点编号", 1, 2147483647) for value in body["nodeIds"]))
+                raise APIError(400, "测速目标选择无效。")
+            node_ids = sorted(set(integer(value, "测速目标编号", 1, 2147483647) for value in body["nodeIds"]))
+        else:
+            address, protocol, port = self._target_input(body)
         with self.transaction() as db:
             for node_id in node_ids:
                 self._found(db, "nodes", node_id)
@@ -454,18 +590,17 @@ class Application:
                 if table == "hosts":
                     cursor = db.execute("INSERT INTO hosts(name,address,region,enabled,next_due) VALUES (?,?,?,?,?)", (name, address, region, enabled, self.clock() + 60))
                 else:
-                    cursor = db.execute("INSERT INTO nodes(name,region,enabled) VALUES (?,?,?)", (name, region, enabled))
+                    cursor = db.execute("INSERT INTO nodes(name,region,enabled,address,protocol,port,needs_configuration) VALUES (?,?,?,?,?,?,0)", (name, region, enabled, address, protocol, port))
                 object_id = cursor.lastrowid
             else:
                 previous = self._found(db, table, object_id)
                 if table == "hosts":
                     db.execute("UPDATE hosts SET name=?,address=?,region=?,enabled=?,revision=revision+1,next_due=? WHERE id=?", (name, address, region, enabled, self.clock() + 60, object_id))
                     db.execute("UPDATE jobs SET state='cancelled' WHERE host_id=? AND state IN ('queued','leased')", (object_id,))
-                    if previous["address"] != address:
-                        db.execute("DELETE FROM fleet_results WHERE host_id=?", (object_id,))
                 else:
-                    db.execute("UPDATE nodes SET name=?,region=?,enabled=? WHERE id=?", (name, region, enabled, object_id))
-                    if not enabled:
+                    changed = (previous["address"], previous["protocol"], previous["port"]) != (address, protocol, port)
+                    db.execute("UPDATE nodes SET name=?,region=?,enabled=?,address=?,protocol=?,port=?,needs_configuration=0,revision=revision+? WHERE id=?", (name, region, enabled, address, protocol, port, int(changed), object_id))
+                    if not enabled or changed:
                         db.execute("UPDATE jobs SET state='cancelled' WHERE node_id=? AND state IN ('queued','leased')", (object_id,))
             if table == "hosts":
                 db.execute("DELETE FROM associations WHERE host_id=?", (object_id,))
@@ -473,7 +608,9 @@ class Application:
             return self._fleet_model(self._found(db, table, object_id), table)
 
     def enrollment(self, role, object_id, base_url):
-        table = "hosts" if role == "vps" else "nodes"
+        if role != "vps":
+            raise APIError(403, "测速目标无需安装探针；请在 VPS 上安装或升级探针。")
+        table = "hosts"
         token, now = secrets.token_urlsafe(32), self.clock()
         source = self.asset("agent.py")
         expected_sha = hashlib.sha256(source).hexdigest()
@@ -484,10 +621,12 @@ class Application:
         filename = "xiaowork-watch-agent-install.sh"
         protocol = "'=https'" if base_url.startswith("https:") else "'=http,https'"
         command = "curl -fsS --proto " + protocol + " " + shlex.quote(base_url + "/agent/install.sh") + " -o " + filename + " && sudo bash " + filename
+        upgrade = command + " --upgrade --server " + shlex.quote(base_url) + " --agent-sha " + expected_sha
         command += " --server " + shlex.quote(base_url) + " --enrollment-token " + shlex.quote(token) + " --agent-sha " + expected_sha
         if base_url.startswith("http:"):
             command += " --development"
-        return {"demo": False, "command": command, "expiresAt": stamp(now + 600)}
+            upgrade += " --development"
+        return {"demo": False, "command": command, "upgradeCommand": upgrade, "expiresAt": stamp(now + 600)}
 
     def enroll(self, body):
         fields(body, {"token"}, {"token"})
@@ -499,22 +638,23 @@ class Application:
             row = db.execute("SELECT * FROM enrollments WHERE token_hash=?", (digest(token),)).fetchone()
             if not row or row["expires"] <= now:
                 raise APIError(401, "注册码无效、已使用或已过期。")
-            table, column = ("hosts", "host_id") if row["role"] == "vps" else ("nodes", "node_id")
+            if row["role"] != "vps":
+                raise APIError(401, "旧测试节点注册码已撤销。")
+            table, column = "hosts", "host_id"
             self._found(db, table, row["object_id"])
-            db.execute("UPDATE " + table + " SET credential_hash=?,last_seen=? WHERE id=?", (digest(credential), now, row["object_id"]))
+            db.execute("UPDATE hosts SET credential_hash=?,last_seen=?,agent_version=NULL WHERE id=?", (digest(credential), now, row["object_id"]))
             db.execute("DELETE FROM enrollments WHERE role=? AND object_id=?", (row["role"], row["object_id"]))
             db.execute("UPDATE jobs SET state='cancelled' WHERE " + column + "=? AND state IN ('queued','leased')", (row["object_id"],))
-            return {"credential": credential, "role": row["role"], "id": row["object_id"], "heartbeatSeconds": HEARTBEAT_SECONDS}
+            return {"credential": credential, "role": "vps", "id": row["object_id"], "heartbeatSeconds": HEARTBEAT_SECONDS}
 
     def agent_identity(self, credential):
         if not isinstance(credential, str) or not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", credential):
             raise APIError(401, "探针凭据无效。")
         hashed = digest(credential)
         with self.lock:
-            for role, table in (("vps", "hosts"), ("probe", "nodes")):
-                row = self.db.execute("SELECT * FROM " + table + " WHERE credential_hash=?", (hashed,)).fetchone()
-                if row:
-                    return role, row["id"], hashed
+            row = self.db.execute("SELECT * FROM hosts WHERE credential_hash=?", (hashed,)).fetchone()
+            if row:
+                return "vps", row["id"], hashed
         raise APIError(401, "探针凭据已撤销或无效。")
 
     def _expire_jobs(self, db):
@@ -530,64 +670,65 @@ class Application:
                 if automatic:
                     return {"count": 0, "queued": True}
                 raise APIError(409, "VPS 必须启用并完成探针安装。")
-            eligible = db.execute("SELECT n.* FROM nodes n JOIN associations a ON n.id=a.node_id WHERE a.host_id=? AND n.enabled=1 AND n.credential_hash IS NOT NULL AND n.last_seen>?", (object_id, self.clock() - OFFLINE_SECONDS)).fetchall()
-            if not eligible:
+            if host["agent_version"] != AGENT_VERSION:
                 if automatic:
                     return {"count": 0, "queued": True}
-                raise APIError(409, "没有关联的在线测试节点。")
-            if all(db.execute("SELECT 1 FROM jobs WHERE host_id=? AND node_id=? AND state IN ('queued','leased')",
-                              (object_id, node["id"])).fetchone() for node in eligible):
-                return {"count": 0, "queued": True}
-        try:
-            target = resolve_target(host["address"], 80, self.allow_private)[0][1][0]
-        except TargetError as error:
-            raise APIError(400, str(error)) from error
-        with self.transaction() as db:
-            current = self._found(db, "hosts", object_id)
-            if not current["enabled"] or current["revision"] != host["revision"] or not current["credential_hash"]:
-                raise APIError(409, "VPS 配置已改变，请重试。")
-            self._expire_jobs(db)
+                raise APIError(409, "请先升级 VPS 探针到协议版本2。")
+            if host["last_seen"] is None or host["last_seen"] < self.clock() - OFFLINE_SECONDS:
+                if automatic:
+                    return {"count": 0, "queued": True}
+                raise APIError(409, "VPS 探针当前离线，请等待恢复心跳。")
+            nodes = db.execute("SELECT n.* FROM nodes n JOIN associations a ON n.id=a.node_id WHERE a.host_id=? AND n.enabled=1 AND n.needs_configuration=0", (object_id,)).fetchall()
+            if not nodes:
+                if automatic:
+                    return {"count": 0, "queued": True}
+                raise APIError(409, "没有关联的已配置测速目标。")
             available = 20000 - db.execute("SELECT count(*) FROM jobs WHERE state IN ('queued','leased')").fetchone()[0]
             if available <= 0:
                 raise APIError(429, "任务队列已达到上限。")
-            nodes = db.execute("SELECT n.* FROM nodes n JOIN associations a ON n.id=a.node_id WHERE a.host_id=? AND n.enabled=1 AND n.credential_hash IS NOT NULL AND n.last_seen>?", (object_id, self.clock() - OFFLINE_SECONDS)).fetchall()
             count = 0
             for node in nodes:
                 if count >= available:
                     break
                 if db.execute("SELECT 1 FROM jobs WHERE host_id=? AND node_id=? AND state IN ('queued','leased')", (object_id, node["id"])).fetchone():
                     continue
-                db.execute("INSERT INTO jobs(id,host_id,node_id,target,host_revision,node_name,region,created,expires,state) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                           (uuid.uuid4().hex, object_id, node["id"], target, current["revision"], node["name"], node["region"], self.clock(), self.clock() + 180, "queued"))
+                db.execute("INSERT INTO jobs(id,host_id,node_id,target,host_revision,node_name,region,created,expires,state,credential_hash,node_revision,protocol,port,task_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                           (uuid.uuid4().hex, object_id, node["id"], node["address"], host["revision"], node["name"], node["region"], self.clock(), self.clock() + 180, "queued", host["credential_hash"], node["revision"], node["protocol"], node["port"], AGENT_VERSION))
                 count += 1
             return {"count": count, "queued": True}
 
     def _job_allowed(self, db, job):
-        row = db.execute("SELECT h.enabled,h.revision,n.enabled AS node_enabled,n.credential_hash FROM hosts h JOIN associations a ON h.id=a.host_id JOIN nodes n ON n.id=a.node_id WHERE h.id=? AND n.id=?", (job["host_id"], job["node_id"])).fetchone()
-        return row is not None and row["enabled"] and row["node_enabled"] and row["revision"] == job["host_revision"] and row["credential_hash"] is not None
+        row = db.execute("SELECT h.enabled,h.revision,h.credential_hash,h.agent_version,n.enabled AS node_enabled,n.revision AS node_revision,n.needs_configuration FROM hosts h JOIN associations a ON h.id=a.host_id JOIN nodes n ON n.id=a.node_id WHERE h.id=? AND n.id=?", (job["host_id"], job["node_id"])).fetchone()
+        return (row is not None and row["enabled"] and row["node_enabled"] and not row["needs_configuration"]
+                and row["revision"] == job["host_revision"] and row["node_revision"] == job["node_revision"]
+                and row["agent_version"] == AGENT_VERSION and job["task_version"] == AGENT_VERSION
+                and row["credential_hash"] == job["credential_hash"])
 
     def heartbeat(self, credential, body):
-        fields(body, set())
+        fields(body, {"agentVersion"})
+        version = integer(body.get("agentVersion", 1), "探针协议版本", 1, AGENT_VERSION)
         role, object_id, hashed = self.agent_identity(credential)
         with self.transaction() as db:
             table = "hosts" if role == "vps" else "nodes"
-            updated = db.execute("UPDATE " + table + " SET last_seen=? WHERE id=? AND credential_hash=?", (self.clock(), object_id, hashed))
+            updated = db.execute("UPDATE hosts SET last_seen=?,agent_version=? WHERE id=? AND credential_hash=?", (self.clock(), version, object_id, hashed))
             if not updated.rowcount:
                 raise APIError(401, "探针凭据已撤销。")
             self._expire_jobs(db)
             tasks = []
-            if role == "probe" and self._found(db, table, object_id)["enabled"]:
-                rows = db.execute("SELECT * FROM jobs WHERE node_id=? AND state IN ('leased','queued') ORDER BY CASE state WHEN 'leased' THEN 0 ELSE 1 END,created LIMIT 100", (object_id,)).fetchall()
+            if version != AGENT_VERSION:
+                db.execute("UPDATE jobs SET state='cancelled' WHERE host_id=? AND state IN ('queued','leased')", (object_id,))
+            elif self._found(db, table, object_id)["enabled"]:
+                rows = db.execute("SELECT * FROM jobs WHERE host_id=? AND state IN ('leased','queued') ORDER BY CASE state WHEN 'leased' THEN 0 ELSE 1 END,created LIMIT 100", (object_id,)).fetchall()
                 for job in rows:
                     if not self._job_allowed(db, job) or (job["credential_hash"] and job["credential_hash"] != hashed):
                         db.execute("UPDATE jobs SET state='cancelled' WHERE id=?", (job["id"],))
                         continue
                     if job["state"] == "queued":
                         db.execute("UPDATE jobs SET state='leased',expires=?,credential_hash=? WHERE id=?", (self.clock() + 60, hashed, job["id"]))
-                    tasks.append({"id": job["id"], "hostId": job["host_id"], "target": job["target"], "sent": 5, "timeoutSeconds": 8})
+                    tasks.append({"id": job["id"], "hostId": job["host_id"], "nodeId": job["node_id"], "target": job["target"], "protocol": job["protocol"], "port": job["port"], "sent": 5, "timeoutSeconds": 8, "taskVersion": AGENT_VERSION})
                     if len(tasks) == 10:
                         break
-            return {"role": role, "heartbeatSeconds": HEARTBEAT_SECONDS, "tasks": tasks}
+            return {"role": "vps", "heartbeatSeconds": HEARTBEAT_SECONDS, "tasks": tasks, "agentUpdateRequired": version != AGENT_VERSION, "requiredAgentVersion": AGENT_VERSION}
 
     def agent_result(self, credential, body):
         fields(body, {"jobId", "sent", "received", "avgRttMs", "status", "error"}, {"jobId", "sent", "received", "avgRttMs", "status"})
@@ -610,15 +751,13 @@ class Application:
         error = text(body.get("error") or "", "错误说明", 1000, required=False) or None
         normalized = json.dumps({"sent": sent, "received": received, "avgRttMs": average, "status": status_value, "error": error}, sort_keys=True, separators=(",", ":"))
         role, object_id, hashed = self.agent_identity(credential)
-        if role != "probe":
-            raise APIError(403, "VPS 探针不能提交线路测量。")
         with self.transaction() as db:
-            if not db.execute("SELECT 1 FROM nodes WHERE id=? AND credential_hash=?", (object_id, hashed)).fetchone():
+            if not db.execute("SELECT 1 FROM hosts WHERE id=? AND credential_hash=?", (object_id, hashed)).fetchone():
                 raise APIError(401, "探针凭据已撤销。")
             job = db.execute("SELECT * FROM jobs WHERE id=?", (body["jobId"],)).fetchone()
             if job is None:
                 raise APIError(404, "任务不存在。")
-            if job["node_id"] != object_id or job["credential_hash"] != hashed:
+            if job["host_id"] != object_id or job["credential_hash"] != hashed or job["task_version"] != AGENT_VERSION:
                 raise APIError(403, "此任务不属于当前探针。")
             if job["state"] == "completed":
                 if not hmac.compare_digest(job["result_json"], normalized):
@@ -626,8 +765,8 @@ class Application:
                 return {"accepted": True, "duplicate": True, "jobId": job["id"]}
             if job["state"] != "leased" or job["expires"] <= self.clock() or not self._job_allowed(db, job):
                 raise APIError(409, "任务已过期或关联配置已改变。")
-            db.execute("INSERT INTO fleet_results(job_id,host_id,node_id,node_name,region,sent,received,avg_rtt,status,error,checked) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                       (job["id"], job["host_id"], job["node_id"], job["node_name"], job["region"], sent, received, average, status_value, error, self.clock()))
+            db.execute("INSERT INTO fleet_results(job_id,host_id,node_id,node_name,region,sent,received,avg_rtt,status,error,checked,direction,protocol,target_address,target_port,node_revision) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (job["id"], job["host_id"], job["node_id"], job["node_name"], job["region"], sent, received, average, status_value, error, self.clock(), "VPS_TO_TARGET", job["protocol"], job["target"], job["port"], job["node_revision"]))
             db.execute("UPDATE jobs SET state='completed',result_json=? WHERE id=?", (normalized, job["id"]))
             self._prune(db, "fleet_results", "host_id", job["host_id"])
             return {"accepted": True, "duplicate": False, "jobId": job["id"]}
@@ -644,6 +783,8 @@ class Application:
         raise APIError(503, "探针发布文件尚不可用。")
 
     def schedule_once(self):
+        if self.in_maintenance():
+            return
         now = self.clock()
         with self.lock:
             due = [row[0] for row in self.db.execute("SELECT id FROM monitors WHERE enabled=1 AND next_due<=? ORDER BY next_due LIMIT 20", (now,))]
@@ -658,7 +799,7 @@ class Application:
                 self._release_monitor(object_id)
         with self.transaction() as db:
             self._expire_jobs(db)
-            hosts = [row[0] for row in db.execute("SELECT id FROM hosts WHERE enabled=1 AND credential_hash IS NOT NULL AND next_due<=? ORDER BY next_due LIMIT 100", (now,))]
+            hosts = [row[0] for row in db.execute("SELECT id FROM hosts WHERE enabled=1 AND credential_hash IS NOT NULL AND agent_version=2 AND last_seen>=? AND next_due<=? ORDER BY next_due LIMIT 100", (now - OFFLINE_SECONDS, now))]
         for object_id in hosts:
             if self.stop.is_set():
                 break
@@ -878,10 +1019,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path, method = parsed.path.rstrip("/") or "/", self.command
         if method == "HEAD":
             method = "GET"
+        if method in ("POST", "PUT", "PATCH", "DELETE") and self.app.in_maintenance():
+            raise APIError(503, "主控正在升级，请稍后重试")
         if method not in ("GET", "OPTIONS") and path.startswith("/api/"):
             self._secure_write()
         if path == "/api/health" and method == "GET":
-            return self._respond(200, {"status": "ok", "release": os.environ.get("WATCH_RELEASE", "development"), "version": VERSION})
+            return self._respond(200, {"status": "ok", "release": os.environ.get("WATCH_RELEASE", "development"), "version": VERSION, "dataSchema": DATA_SCHEMA})
         if path.startswith("/agent/") and method == "GET":
             filename = path[7:]
             if filename not in ("install.sh", "agent.py", "agent.py.sha256"):

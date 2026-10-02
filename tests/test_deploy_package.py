@@ -64,6 +64,7 @@ class PackageTests(unittest.TestCase):
         with tarfile.open(self.root / 'live/xiaowork-watch-web.tar.gz') as archive:
             metadata = json.load(archive.extractfile('release.json'))
             self.assertEqual(metadata['kind'], 'monitoring-server')
+            self.assertEqual(metadata['dataSchema'], 2)
             self.assertIn('.backend/server.py', archive.getnames())
             self.assertIn('.deploy/runtime.py', archive.getnames())
             self.assertIn('.agent/agent.py', archive.getnames())

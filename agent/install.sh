@@ -8,8 +8,9 @@ CONFIG_DIR=/etc/xiaowork-watch-agent
 UNIT=/etc/systemd/system/xiaowork-watch-agent.service
 UNIT_NAME=xiaowork-watch-agent.service
 OWNER=xiaowork-watch-agent-managed-v1
-server= token= expected_sha= development=false uninstall=false
+server= token= expected_sha= development=false uninstall=false upgrade=false
 temporary= created_user=false created_group=false created_app=false created_config=false created_unit=false success=false
+upgrade_replaced=false upgrade_staged=false upgrade_candidate= prior_active=false
 
 die() { printf '%s\n' "$1" >&2; exit 1; }
 
@@ -25,6 +26,7 @@ while (($#)); do
             shift 2 ;;
         --development) development=true; shift ;;
         --uninstall) uninstall=true; shift ;;
+        --upgrade) upgrade=true; shift ;;
         *) die 'Unknown installation option.' ;;
     esac
 done
@@ -82,9 +84,27 @@ owned_marker() {
     printf '%s\nuid=%s\ngid=%s\n' "$OWNER" "$agent_uid" "$agent_gid"
 }
 
+safe_mode() {
+    local mode
+    mode=$(stat -c %a "$1")
+    [[ $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 0022) == 0 )) || die 'Agent paths must not be writable by other accounts.'
+}
+
 cleanup() {
     local result=$?
     trap - EXIT
+    if [[ $success != true && $upgrade_replaced == true ]]; then
+        if install -o root -g root -m 644 "$temporary/old-agent.py" "$upgrade_candidate" && mv -fT -- "$upgrade_candidate" "$APP_DIR/agent.py"; then
+            if [[ $prior_active == true ]]; then
+                systemctl restart "$UNIT_NAME" >/dev/null 2>&1 || printf '%s\n' 'Old agent code was restored; the service needs attention.' >&2
+            else
+                systemctl stop "$UNIT_NAME" >/dev/null 2>&1 || true
+            fi
+        else
+            printf '%s\n' 'Unable to restore the old agent code; backup remains in the temporary directory.' >&2
+            temporary=
+        fi
+    fi
     if [[ $success != true ]]; then
         if [[ $created_unit == true ]]; then
             systemctl disable --now "$UNIT_NAME" >/dev/null 2>&1 || true
@@ -103,15 +123,15 @@ cleanup() {
         [[ $created_group != true ]] || groupdel "$AGENT_USER" >/dev/null 2>&1 || true
     fi
     if [[ -n $temporary ]]; then
-        rm -f -- "$temporary/agent.py" "$temporary/agent.py.sha256" "$temporary/config.json"
+        rm -f -- "$temporary/agent.py" "$temporary/agent.py.sha256" "$temporary/config.json" "$temporary/old-agent.py"
         rmdir -- "$temporary" 2>/dev/null || true
     fi
+    [[ $upgrade_staged != true ]] || rm -f -- "$upgrade_candidate"
     exit "$result"
 }
 trap cleanup EXIT
 
-if [[ $uninstall == true ]]; then
-    [[ -z $server && -z $token && -z $expected_sha && $development == false ]] || die 'Uninstall cannot be combined with enrollment options.'
+verify_owned() {
     [[ -d $APP_DIR && -d $CONFIG_DIR && -f $UNIT && -f $APP_DIR/agent.py && -f $CONFIG_DIR/config.json ]] || die 'A complete owned agent installation was not found; nothing was removed.'
     passwd_entry=$(getent passwd "$AGENT_USER") || die 'Agent account is missing; ownership cannot be verified.'
     IFS=: read -r name password agent_uid agent_gid comment home shell <<< "$passwd_entry"
@@ -121,11 +141,13 @@ if [[ $uninstall == true ]]; then
     [[ $group_name == "$AGENT_USER" && $group_gid == "$agent_gid" && -z $members ]] || die 'The agent group has unexpected ownership or members.'
     for directory in "$APP_DIR" "$CONFIG_DIR"; do
         [[ $(stat -c %u "$directory") == 0 ]] || die 'The agent directory is not root-owned.'
+        safe_mode "$directory"
         [[ -f $directory/.managed && ! -L $directory/.managed && $(stat -c %u "$directory/.managed") == 0 ]] || die 'Agent ownership marker is missing or unsafe.'
         cmp -s "$directory/.managed" <(owned_marker) || die 'The installation belongs to a different account generation.'
         shopt -s dotglob nullglob
         for entry in "$directory"/*; do
             [[ -f $entry && ! -L $entry && $(stat -c %u "$entry") == 0 ]] || die 'Unexpected files were found; nothing was removed.'
+            safe_mode "$entry"
             case "$entry" in
                 "$APP_DIR/agent.py"|"$APP_DIR/.managed"|"$CONFIG_DIR/config.json"|"$CONFIG_DIR/.managed") ;;
                 *) die 'Unexpected data was found in an agent directory; nothing was removed.' ;;
@@ -133,6 +155,15 @@ if [[ $uninstall == true ]]; then
         done
     done
     [[ $(stat -c %u "$UNIT") == 0 ]] && cmp -s "$UNIT" <(unit_text) || die 'The service unit is not owned by this installer.'
+    safe_mode "$UNIT"
+}
+
+if [[ $uninstall == true ]]; then
+    [[ -z $server && -z $token && -z $expected_sha && $development == false && $upgrade == false ]] || die 'Uninstall cannot be combined with installation options.'
+    verify_owned
+    exec 9<"$APP_DIR"
+    flock -n 9 || die 'Another agent management operation is running.'
+    verify_owned
     systemctl disable --now "$UNIT_NAME"
     rm -- "$UNIT"
     systemctl daemon-reload
@@ -145,7 +176,11 @@ if [[ $uninstall == true ]]; then
     exit 0
 fi
 
-[[ $token =~ ^[A-Za-z0-9_-]{16,512}$ ]] || die 'A valid enrollment token is required.'
+if [[ $upgrade == true ]]; then
+    [[ -z $token ]] || die 'Upgrade must not include an enrollment token.'
+else
+    [[ $token =~ ^[A-Za-z0-9_-]{16,512}$ ]] || die 'A valid enrollment token is required.'
+fi
 [[ $expected_sha =~ ^[a-f0-9]{64}$ ]] || die 'The installation command must include --agent-sha (generate a new command in the controller).'
 server=${server%/}
 if [[ $server =~ ^https://([A-Za-z0-9.-]+|\[[0-9a-fA-F:]+\])(:[0-9]+)?$ ]]; then
@@ -156,16 +191,25 @@ else
     die 'Use an HTTPS control server origin. HTTP requires --development and localhost.'
 fi
 
-for path in "$APP_DIR" "$CONFIG_DIR" "$UNIT"; do
-    [[ ! -e $path && ! -L $path ]] || die 'An agent path already exists. Nothing was overwritten; uninstall the existing owned agent first.'
-done
-! getent passwd "$AGENT_USER" >/dev/null || die 'The agent account already exists; nothing was overwritten.'
-! getent group "$AGENT_USER" >/dev/null || die 'The agent group already exists; nothing was overwritten.'
+if [[ $upgrade == true ]]; then
+    verify_owned
+    exec 9<"$APP_DIR"
+    flock -n 9 || die 'Another agent management operation is running.'
+    verify_owned
+else
+    for path in "$APP_DIR" "$CONFIG_DIR" "$UNIT"; do
+        [[ ! -e $path && ! -L $path ]] || die 'An agent path already exists. Nothing was overwritten; uninstall the existing owned agent first.'
+    done
+    ! getent passwd "$AGENT_USER" >/dev/null || die 'The agent account already exists; nothing was overwritten.'
+    ! getent group "$AGENT_USER" >/dev/null || die 'The agent group already exists; nothing was overwritten.'
+fi
 command -v systemctl >/dev/null || die 'systemd is required.'
 [[ -d /run/systemd/system ]] || die 'Run this installer on a server with systemd running.'
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y --no-install-recommends python3 curl iputils-ping ca-certificates
+if [[ $upgrade != true ]]; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends python3 curl iputils-ping ca-certificates
+fi
 temporary=$(mktemp -d /tmp/xiaowork-watch-agent.XXXXXXXX)
 curl -fsS --proto "=$protocol" --connect-timeout 10 --max-time 60 --retry 2 --max-filesize 262144 "$server/agent/agent.py" -o "$temporary/agent.py"
 curl -fsS --proto "=$protocol" --connect-timeout 10 --max-time 30 --retry 2 --max-filesize 1024 "$server/agent/agent.py.sha256" -o "$temporary/agent.py.sha256"
@@ -175,6 +219,25 @@ checksum_line=$(cat "$temporary/agent.py.sha256")
 actual_sha=$(sha256sum "$temporary/agent.py")
 [[ ${actual_sha%% *} == "$expected_sha" ]] || die 'Agent source checksum verification failed.'
 /usr/bin/python3 -I -B -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read())' "$temporary/agent.py"
+if [[ $upgrade == true ]]; then
+    arguments=(--check-upgrade --server "$server" --config "$CONFIG_DIR/config.json")
+    [[ $development != true ]] || arguments+=(--development)
+    /usr/bin/python3 -I -B "$temporary/agent.py" "${arguments[@]}"
+    if systemctl is-active --quiet "$UNIT_NAME"; then prior_active=true; fi
+    cp -- "$APP_DIR/agent.py" "$temporary/old-agent.py"
+    upgrade_candidate="$APP_DIR/.agent.py.upgrade.$$"
+    [[ ! -e $upgrade_candidate && ! -L $upgrade_candidate ]] || die 'An upgrade staging path already exists.'
+    (set -o noclobber; : > "$upgrade_candidate")
+    upgrade_staged=true
+    install -o root -g root -m 644 "$temporary/agent.py" "$upgrade_candidate"
+    upgrade_replaced=true
+    mv -fT -- "$upgrade_candidate" "$APP_DIR/agent.py"
+    systemctl restart "$UNIT_NAME"
+    systemctl is-active --quiet "$UNIT_NAME"
+    success=true
+    printf '%s\n' 'xiaowork Watch VPS agent upgraded. Existing registration and configuration were retained.'
+    exit 0
+fi
 arguments=(--enroll --server "$server" --token "$token" --config "$temporary/config.json")
 [[ $development != true ]] || arguments+=(--development)
 /usr/bin/python3 -I -B "$temporary/agent.py" "${arguments[@]}"

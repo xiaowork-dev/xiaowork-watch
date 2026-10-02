@@ -167,7 +167,7 @@ def check_http(url, method="GET", timeout_ms=5000, allow_private=False):
             deadline_timer.start()
             response = None
             try:
-                connection.request(method, path, headers={"Host": authority, "User-Agent": "xiaowork-watch/0.3.0",
+                connection.request(method, path, headers={"Host": authority, "User-Agent": "xiaowork-watch/0.4.0",
                                    "Accept": "*/*", "Accept-Encoding": "identity", "Connection": "close"})
                 response = connection.getresponse()
                 if time.monotonic() >= deadline:

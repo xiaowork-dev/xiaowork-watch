@@ -270,6 +270,8 @@ def _validate_release(directory, sha):
     if (directory / "assets").is_symlink() or not (directory / "assets").is_dir():
         raise DeploymentError("Release is missing its assets directory")
     if metadata["kind"] == "monitoring-server":
+        if type(metadata.get('dataSchema', 1)) is not int or metadata.get('dataSchema', 1) not in (1, 2):
+            raise DeploymentError('Release uses an unsupported data schema')
         for name in (".deploy/console.py", ".deploy/runtime.py", ".backend/server.py", ".agent/agent.py", ".agent/install.sh"):
             if not _regular(directory / name) or not (directory / name).stat().st_size:
                 raise DeploymentError("Live release is missing " + name)
@@ -504,6 +506,9 @@ class Manager:
 
     def _activate(self, sha, config, resume=False):
         old, previous = self._pointed_sha("current"), self._pointed_sha("previous")
+        installed_path = self.root / 'installed.json'
+        old_record = _json_file(installed_path) if installed_path.exists() or installed_path.is_symlink() else None
+        record_attempted = False
         old_config = dict(config)
         config_written = False
         runtime = None
@@ -526,14 +531,26 @@ class Manager:
                     config["autoUpdate"] = True
                 _atomic_json(self.root / "config.json", config)
                 config_written = True
+            record_attempted = True
             self._record(sha, old if old and old != sha else previous)
-        except Exception:
-            self._switch("current", old)
-            self._switch("previous", previous)
-            if config_written:
-                _atomic_json(self.root / "config.json", old_config)
             if runtime is not None:
-                runtime.restore()
+                runtime.commit()
+        except Exception:
+            try:
+                self._switch("current", old)
+                self._switch("previous", previous)
+                if config_written:
+                    _atomic_json(self.root / "config.json", old_config)
+                if record_attempted:
+                    if old_record is not None:
+                        _atomic_json(installed_path, old_record)
+                    elif installed_path.exists() or installed_path.is_symlink():
+                        if not _regular(installed_path):
+                            raise DeploymentError('Cannot safely restore the installation record')
+                        installed_path.unlink()
+            finally:
+                if runtime is not None:
+                    runtime.restore()
             raise
 
     def install_or_update(self, automatic=False, tag=None):
@@ -555,6 +572,11 @@ class Manager:
         previous_kind = _validate_release(self.releases / previous, previous)["kind"]
         if current_kind == "monitoring-server" and previous_kind != "monitoring-server":
             raise DeploymentError("上一版是模拟原型，不能作为真实监控的回退版本；数据已保留。")
+        if current_kind == previous_kind == 'monitoring-server':
+            current_schema = _validate_release(self.releases / current, current).get('dataSchema', 1)
+            previous_schema = _validate_release(self.releases / previous, previous).get('dataSchema', 1)
+            if current_schema > previous_schema:
+                raise DeploymentError('当前数据库已升级，不能回退到旧数据结构的版本；监控数据及升级前备份已保留。')
         config["autoUpdate"] = False
         _atomic_json(self.root / "config.json", config)
         self._assets(self.releases / previous)

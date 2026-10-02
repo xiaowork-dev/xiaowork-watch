@@ -7,7 +7,8 @@ const mod = file => import(pathToFileURL(join(root, 'src/api', file)).href)
 const { default: viteConfig } = await import(pathToFileURL(join(root, 'vite.config.js')).href)
 const { request, authApi, getSession, subscribeSession } = await mod('client.js')
 const { monitorsApi } = await mod('monitors.js')
-const { fleetApi, validateFleet } = await mod('fleet.js')
+const { fleetApi, validateFleet, normalizeAddress, parseTarget } = await mod('fleet.js')
+const { targetConfigured, canMeasureHost, formatEndpoint, latestMeasurement, measurementProtocol, failureLabel, failureRate, measurementRtt, measurementLabel, directionLabel } = await mod('measurements.js')
 const { validateMonitor } = await mod('model.js')
 const { parseRoute, routePath } = await mod('routes.js')
 const { agentState, resultIsStale, relativeTime } = await mod('time.js')
@@ -48,9 +49,28 @@ await test('every monitor and fleet mutation sends CSRF', async () => {
  const before = calls.length; respond({ id: 1 })
  await monitorsApi.create(monitor); await monitorsApi.update(1, monitor); await monitorsApi.setEnabled(1, false); await monitorsApi.check(1, 1000); await monitorsApi.remove(1)
  const host = { name: 'VPS', address: '203.0.113.10', region: '', enabled: true, nodeIds: [2] }
- await fleetApi.create('vps', host); await fleetApi.update('vps', 1, host); await fleetApi.toggle('nodes', 2, false); await fleetApi.check(1); await fleetApi.installation('nodes', 2); await fleetApi.remove('vps', 1)
+ await fleetApi.create('vps', host); await fleetApi.update('vps', 1, host); await fleetApi.toggle('nodes', 2, false); await fleetApi.check(1); await fleetApi.installation('vps', 1); await fleetApi.remove('vps', 1)
  assert(calls.slice(before).every(call => call.options.method !== 'GET' && call.options.headers['X-CSRF-Token'] === 'fixture-csrf'))
- assert.equal(calls.at(-2).url, '/api/probes/2/enrollment')
+ assert.equal(calls.at(-2).url, '/api/vps/1/enrollment')
+})
+await test('target CRUD splits TCP endpoints and never sends an enrollment request', async () => {
+ respond({ id: 2 })
+ const target = { name: 'Carrier', address: 'HB-CT-V4.ip.zstaticcdn.com:80', protocol: 'TCP', port: '', region: '华北', enabled: true }
+ await fleetApi.create('nodes', target)
+ assert.equal(calls.at(-1).url, '/api/probes')
+ assert.deepEqual(JSON.parse(calls.at(-1).options.body), { name: 'Carrier', address: 'hb-ct-v4.ip.zstaticcdn.com', protocol: 'TCP', port: 80, region: '华北', enabled: true })
+ await fleetApi.update('nodes', 2, { ...target, address: '1.1.1.1', protocol: 'ICMP', port: null })
+ assert.equal(calls.at(-1).url, '/api/probes/2')
+ assert.equal(JSON.parse(calls.at(-1).options.body).port, null)
+ const before = calls.length
+ await assert.rejects(fleetApi.installation('nodes', 2), /无需安装/)
+ assert.equal(calls.length, before)
+})
+await test('HTTP write refusal retains the backend HTTPS instruction without a login loop', async () => {
+ status = 403; response = { code: 1, message: '请先在服务器菜单8配置HTTPS，再登录后台。', data: null }
+ await assert.rejects(fleetApi.check(1), /菜单8配置HTTPS/)
+ assert.equal(getSession().authenticated, true)
+ respond({})
 })
 await test('history preserves pagination and never schedules a check', async () => {
  const before = calls.length; respond({ records: [], page: 2, size: 8, total: 9 })
@@ -107,6 +127,80 @@ await test('fleet rejects invalid addresses and node identifiers', () => {
  for (const address of ['https://example.com', 'evil/host', '999.1.1.1', 'host:22', '-host']) assert(validateFleet({ ...value, address }, 'vps').errors.address)
  assert(validateFleet({ ...value, nodeIds: ['1'] }, 'vps').errors.nodeIds)
  assert.deepEqual(validateFleet({ ...value, address: '2001:db8::1' }, 'vps').errors, {})
+})
+await test('ICMP and TCP parse hostname, IPv4 and bracketed IPv6 without ambiguous ports', () => {
+ assert.deepEqual(parseTarget(' Example.COM ', 'ICMP'), { address: 'example.com', protocol: 'ICMP', port: null })
+ assert.deepEqual(parseTarget('1.1.1.1:443', 'TCP'), { address: '1.1.1.1', protocol: 'TCP', port: 443 })
+ assert.deepEqual(parseTarget('example.com', 'TCP', 65535), { address: 'example.com', protocol: 'TCP', port: 65535 })
+ assert.deepEqual(parseTarget('[2001:0DB8::1]:80', 'TCP', 80), { address: '2001:db8::1', protocol: 'TCP', port: 80 })
+ assert.deepEqual(parseTarget('2001:db8::1', 'TCP', 443), { address: '2001:db8::1', protocol: 'TCP', port: 443 })
+ assert.deepEqual(parseTarget('[2001:db8::1]', 'ICMP'), { address: '2001:db8::1', protocol: 'ICMP', port: null })
+ assert.equal(formatEndpoint('2001:db8::1', 'TCP', 80), '[2001:db8::1]:80')
+ assert.equal(formatEndpoint('example.com', 'ICMP', null), 'example.com')
+})
+await test('ICMP refuses explicit ports and TCP requires a matching bounded integer', () => {
+ for (const [address, protocol, port] of [
+  ['example.com:80', 'ICMP', null], ['[2001:db8::1]:80', 'ICMP', null], ['example.com', 'ICMP', 80],
+  ['example.com', 'TCP', null], ['example.com:', 'TCP', null], ['example.com:80', 'TCP', 443],
+  ['example.com', 'TCP', 0], ['example.com', 'TCP', 65536], ['example.com', 'TCP', 1.5],
+  ['example.com', 'TCP', '80;id'], ['example.com', 'TCP', true], ['example.com', 'UDP', 80]
+ ]) assert.throws(() => parseTarget(address, protocol, port), Error, `${address}/${protocol}/${port}`)
+ const result = validateFleet({ name: 'Target', address: 'example.com:80', protocol: 'ICMP', port: null, region: '', enabled: true }, 'nodes')
+ assert(result.errors.port)
+})
+await test('addresses reject URLs, malformed IP, shell-like text and hostname brackets', () => {
+ for (const address of ['https://example.com', 'example.com/path', 'user@example.com', 'example.com?x=1', 'evil;id', 'bad\nhost', '999.1.1.1', '01.1.1.1', '2001:::1', '[example.com]', '[1.1.1.1]', '-host', 'host-', 'a..b', '中文.example', '2001:db8::1%eth0']) assert.throws(() => normalizeAddress(address), Error, address)
+ assert.throws(() => parseTarget('[example.com]:80', 'TCP'), /IPv6/)
+ const result = validateFleet({ name: 'Target', address: 'example.com', protocol: 'TCP', port: 443, region: '', enabled: true }, 'nodes')
+ assert.deepEqual(result.errors, {})
+ assert.deepEqual(result.value, { name: 'Target', address: 'example.com', protocol: 'TCP', port: 443, region: '', enabled: true })
+ assert(validateFleet({ ...result.value, enabled: 'false' }, 'nodes').errors.enabled)
+})
+await test('legacy unconfigured targets stay unusable and old VPS agents cannot measure', () => {
+ const now = Date.parse('2026-10-02T12:00:00Z')
+ const target = { id: 2, address: 'example.com', protocol: 'TCP', port: 80, enabled: true, needsConfiguration: false }
+ const host = { enabled: true, nodeIds: [2], agentVersion: 2, agentUpdateRequired: false, agentState: 'ONLINE', lastSeenAt: '2026-10-02T11:59:30Z' }
+ assert.equal(targetConfigured(target), true)
+ assert.equal(targetConfigured({ ...target, address: '', needsConfiguration: true }), false)
+ assert.equal(targetConfigured({ ...target, port: null }), false)
+ assert.equal(canMeasureHost(host, [target], now), true)
+ for (const changes of [{ enabled: false }, { agentVersion: 1 }, { agentVersion: null }, { agentUpdateRequired: true }, { agentState: 'PENDING' }, { lastSeenAt: '2026-10-02T11:58:00Z' }, { nodeIds: [] }]) assert.equal(canMeasureHost({ ...host, ...changes }, [target], now), false)
+ for (const changes of [{ enabled: false }, { address: '', needsConfiguration: true }]) assert.equal(canMeasureHost(host, [{ ...target, ...changes }], now), false)
+})
+await test('latest outbound measurement cannot mix legacy direction or edited target snapshots', () => {
+ const target = { id: 2, address: 'new.example', protocol: 'TCP', port: 443 }
+ const good = { id: 1, hostId: 1, nodeId: 2, direction: 'VPS_TO_TARGET', protocol: 'TCP', targetAddress: 'new.example', targetPort: 443, checkedAt: '2026-10-02T11:59:00Z' }
+ const results = [good, ...[{ direction: 'NODE_TO_VPS' }, { targetAddress: 'old.example' }, { targetPort: 80 }, { protocol: 'ICMP' }, { hostId: 3 }, { nodeId: 3 }].map((change, index) => ({ ...good, ...change, id: index + 2, checkedAt: '2026-10-02T12:00:00Z' }))]
+ assert.equal(latestMeasurement(results, 1, target), good)
+ assert.equal(latestMeasurement(results.slice(1), 1, target), undefined)
+ const snapshot = structuredClone(results)
+ const newest = { ...good, id: 20, checkedAt: '2026-10-02T12:01:00Z' }
+ assert.equal(latestMeasurement([...results, newest], 1, target), newest)
+ assert.deepEqual(results, snapshot)
+ assert.equal(directionLabel(good), 'VPS → 测速目标')
+ assert.equal(directionLabel({ direction: 'NODE_TO_VPS' }), '旧版：测试节点 → VPS')
+ assert.equal(measurementProtocol({ direction: 'NODE_TO_VPS' }), 'ICMP')
+ assert.equal(formatEndpoint('', 'ICMP'), '未记录地址')
+})
+await test('TCP reports connection failure rate while ICMP reports packet loss', () => {
+ const tcp = { protocol: 'TCP', direction: 'VPS_TO_TARGET', status: 'OK', sent: 5, received: 4, avgRttMs: 12.5 }
+ const icmp = { ...tcp, protocol: 'ICMP' }
+ assert.equal(failureLabel(tcp), '连接失败率'); assert.equal(failureLabel(icmp), '丢包率')
+ assert.equal(failureRate(tcp), '20%'); assert.equal(failureRate(icmp), '20%')
+ assert.equal(measurementLabel(tcp), '连接成功'); assert.equal(measurementLabel(icmp), '收到回复')
+ assert.equal(measurementLabel({ ...tcp, status: 'TIMEOUT', received: 0 }), '连接失败')
+ assert.equal(measurementLabel({ ...icmp, status: 'TIMEOUT', received: 0 }), 'ICMP 无回复')
+ assert.equal(failureRate({ ...tcp, status: 'TIMEOUT', received: 0 }), '100%')
+ assert.equal(measurementRtt({ ...tcp, avgRttMs: 0 }), 0)
+ assert.equal(measurementRtt({ ...tcp, avgRttMs: null }), null)
+})
+await test('execution errors or invalid sample counts never fabricate 100 percent loss or RTT', () => {
+ const failed = { protocol: 'TCP', status: 'ERROR', sent: 0, received: 0, avgRttMs: null, error: 'DNS resolution failed' }
+ assert.equal(measurementLabel(failed), '测量失败')
+ assert.equal(failureRate(failed), '—'); assert.equal(measurementRtt(failed), null)
+ assert.equal(failureRate({ ...failed, sent: 5, received: 0 }), '—')
+ for (const changes of [{ sent: 0 }, { sent: 1.5 }, { received: -1 }, { received: 6 }, { received: null }]) assert.equal(failureRate({ status: 'OK', sent: 5, received: 4, ...changes }), '—')
+ for (const avgRttMs of [null, undefined, NaN, Infinity, -1]) assert.equal(measurementRtt({ status: 'OK', avgRttMs }), null)
 })
 await test('public/admin deep links survive pathname round trips', () => {
  for (const admin of [true, false]) for (const [section, id] of [['web', null], ['web', 17], ['vps', null], ['vps', 8], ['nodes', null]]) assert.deepEqual(parseRoute(routePath(section, id, admin)), { section, id, admin })

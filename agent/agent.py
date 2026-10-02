@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Outbound Linux heartbeat / ICMP probe agent, using only Python's stdlib."""
+"""VPS outbound ICMP/TCP measurements, using only Python's stdlib."""
 import argparse
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import socket
 import ssl
 import stat
 import subprocess
@@ -27,6 +28,10 @@ HTTP_TIMEOUT = 8
 MAX_RESPONSE = 65536
 PING_COUNT = 5
 PING_TIMEOUT = 8
+AGENT_VERSION = 2
+DNS_TIMEOUT = 2
+MAX_DNS_ADDRESSES = 16
+_DNS_SLOTS = threading.BoundedSemaphore(MAX_TASKS)
 _V4_DENIED = tuple(ipaddress.ip_network(value) for value in (
     "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
     "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16", "198.18.0.0/15",
@@ -103,7 +108,7 @@ class Client:
         if endpoint not in ("/api/agent/enroll", "/api/agent/heartbeat", "/api/agent/results"):
             raise AgentError("Unknown agent API endpoint")
         headers = {"Content-Type": "application/json", "Accept": "application/json",
-                   "User-Agent": "xiaowork-watch-agent/1"}
+                   "User-Agent": "xiaowork-watch-agent/2"}
         if self.credential is not None:
             headers["Authorization"] = "Bearer " + self.credential
         request = urllib.request.Request(self.server + endpoint,
@@ -174,6 +179,8 @@ def enroll(server, token, destination, development=False, client=None):
         raise AgentError("Enrollment requires a new configuration file in a regular directory")
     response = (client or Client(normalized, development=development)).post("/api/agent/enroll", {"token": token})
     config = validate_config(dict(response, schema=1, server=normalized, development=development))
+    if config["role"] != "vps":
+        raise AgentError("Only VPS agents can enroll with this version")
     descriptor = os.open(str(destination), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as output:
@@ -210,18 +217,92 @@ def public_target(value, allow_loopback=False):
     return address
 
 
-def validate_task(task, allow_loopback=False):
+def target_name(value):
+    if not isinstance(value, str) or not 1 <= len(value) <= 253 or re.search(r"[\s\x00-\x1f\x7f%]", value):
+        raise AgentError("Invalid measurement target")
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        pass
+    value = value.lower().rstrip(".")
+    if not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", part) for part in value.split(".")):
+        raise AgentError("Target must be a hostname or IP without a port or path")
+    return value
+
+
+def validate_task(task, allow_loopback=False, expected_host=None):
     if not isinstance(task, dict):
-        raise AgentError("Invalid probe task")
-    _identifier(task.get("id"))
-    _identifier(task.get("hostId"))
+        raise AgentError("Invalid measurement task")
+    if type(task.get("taskVersion")) is not int or task["taskVersion"] != AGENT_VERSION:
+        raise AgentError("Unsupported measurement task version")
+    if not isinstance(task.get("id"), str) or not re.fullmatch(r"[a-f0-9]{32}", task["id"]):
+        raise AgentError("Invalid measurement job identifier")
+    for field in ("hostId", "nodeId"):
+        if type(task.get(field)) is not int or not 0 < task[field] <= 9007199254740991:
+            raise AgentError("Invalid measurement object identifier")
+    if expected_host is not None and task["hostId"] != expected_host:
+        raise AgentError("Measurement job belongs to another VPS")
+    if task.get("protocol") not in ("ICMP", "TCP"):
+        raise AgentError("Unsupported measurement protocol")
+    port = task.get("port")
+    if (task["protocol"] == "ICMP" and port is not None) or (task["protocol"] == "TCP" and (type(port) is not int or not 1 <= port <= 65535)):
+        raise AgentError("Invalid measurement port")
     if type(task.get("sent")) is not int or task["sent"] != PING_COUNT:
         raise AgentError("Probe task must request exactly five packets")
     if type(task.get("timeoutSeconds")) is not int or not 5 <= task["timeoutSeconds"] <= PING_TIMEOUT:
         raise AgentError("Invalid probe task timeout")
-    address = public_target(task.get("target"), allow_loopback)
-    return {"id": task["id"], "hostId": task["hostId"], "target": str(address),
+    name = target_name(task.get("target"))
+    try:
+        address = ipaddress.ip_address(name)
+    except ValueError:
+        address = None
+    if address is not None:
+        public_target(name, allow_loopback)
+    return {"id": task["id"], "hostId": task["hostId"], "nodeId": task["nodeId"], "target": name,
+            "protocol": task["protocol"], "port": port, "taskVersion": AGENT_VERSION,
             "sent": PING_COUNT, "timeoutSeconds": task["timeoutSeconds"]}
+
+
+def _resolve_worker(name):
+    # This disposable process may block in libc DNS. The parent kills/reaps it
+    # at its deadline; no unresolved futures or DNS threads survive a timeout.
+    records = socket.getaddrinfo(target_name(name), None, 0, socket.SOCK_STREAM)
+    if len(records) > 64:
+        raise AgentError("Too many DNS records")
+    addresses = list(dict.fromkeys(record[4][0] for record in records if record[0] in (socket.AF_INET, socket.AF_INET6)))
+    if not 1 <= len(addresses) <= MAX_DNS_ADDRESSES:
+        raise AgentError("No bounded DNS result")
+    return addresses
+
+
+def pin_target(name, allow_loopback=False, deadline=None, runner=subprocess.run):
+    name = target_name(name)
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        pass
+    else:
+        return public_target(name, allow_loopback)
+    remaining = DNS_TIMEOUT if deadline is None else min(DNS_TIMEOUT, deadline - time.monotonic())
+    if remaining <= 0 or not _DNS_SLOTS.acquire(blocking=False):
+        raise AgentError("DNS deadline or concurrency limit exceeded")
+    try:
+        result = runner([sys.executable, "-I", "-B", str(Path(__file__).resolve()), "--resolve-target", name],
+                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        timeout=remaining, check=False)
+        if result.returncode or len(result.stdout) > 4096:
+            raise AgentError("DNS resolution failed")
+        addresses = json.loads(result.stdout)
+        if not isinstance(addresses, list) or not 1 <= len(addresses) <= MAX_DNS_ADDRESSES:
+            raise AgentError("Invalid DNS result")
+        # Reject the entire answer if even one candidate is unsafe. Freeze one
+        # validated IP; ping/connect must never resolve the hostname again.
+        verified = [public_target(value, allow_loopback) for value in addresses]
+        return verified[0]
+    except (OSError, subprocess.TimeoutExpired, ValueError, UnicodeError):
+        raise AgentError("DNS resolution failed or returned an unsafe address") from None
+    finally:
+        _DNS_SLOTS.release()
 
 
 def _failure(job_id, message, sent=0):
@@ -252,22 +333,27 @@ def parse_ping(job_id, output, returncode):
     return {"jobId": job_id, "sent": sent, "received": received, "avgRttMs": average, "status": "OK"}
 
 
-def execute_ping(task, allow_loopback=False, runner=subprocess.run):
+def execute_ping(task, allow_loopback=False, runner=subprocess.run, deadline=None):
     try:
         task = validate_task(task, allow_loopback)
+        address = public_target(task["target"], allow_loopback)
     except AgentError:
         # The controller's validation normally prevents this; never ping an
         # unsafe target merely because it arrived over an authenticated API.
         return _failure(_identifier(task.get("id")), "Unsafe or invalid probe task")
-    address = ipaddress.ip_address(task["target"])
+    if task["protocol"] != "ICMP":
+        return _failure(task["id"], "ICMP execution requires an ICMP task")
+    remaining = task["timeoutSeconds"] if deadline is None else min(task["timeoutSeconds"], deadline - time.monotonic())
+    if remaining <= 0:
+        return _failure(task["id"], "Measurement deadline exceeded")
     arguments = ["/usr/bin/ping", "-4" if address.version == 4 else "-6", "-n", "-q",
-                 "-c", str(task["sent"]), "-i", "1", "-W", "2", "-w", str(task["timeoutSeconds"]),
+                 "-c", str(task["sent"]), "-i", "1", "-W", "2", "-w", str(math.ceil(remaining)),
                  "--", task["target"]]
     environment = os.environ.copy()
     environment.update(LC_ALL="C", LANG="C", IPUTILS_PING_PTR_LOOKUP="0")
     try:
         result = runner(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                        env=environment, timeout=task["timeoutSeconds"] + 2, check=False)
+                        env=environment, timeout=remaining + 1, check=False)
     except subprocess.TimeoutExpired:
         return _failure(task["id"], "ping process exceeded its deadline; statistics unavailable")
     except OSError:
@@ -276,18 +362,64 @@ def execute_ping(task, allow_loopback=False, runner=subprocess.run):
     return parse_ping(task["id"], output, result.returncode)
 
 
-def heartbeat_tasks(response, role):
+def execute_tcp(task, address, deadline, socket_factory=socket.socket):
+    family = socket.AF_INET if address.version == 4 else socket.AF_INET6
+    endpoint = (str(address), task["port"]) if address.version == 4 else (str(address), task["port"], 0, 0)
+    sent, times = 0, []
+    for index in range(PING_COUNT):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            connection = socket_factory(family, socket.SOCK_STREAM)
+        except OSError:
+            if not times:
+                return _failure(task["id"], "TCP socket could not start", sent)
+            break
+        try:
+            connection.settimeout(min(1, remaining / (PING_COUNT - index)))
+            started = time.monotonic()
+            sent += 1
+            connection.connect(endpoint)
+            times.append((time.monotonic() - started) * 1000)
+        except OSError:
+            pass
+        finally:
+            connection.close()
+    if times:
+        return {"jobId": task["id"], "sent": sent, "received": len(times),
+                "avgRttMs": sum(times) / len(times), "status": "OK"}
+    if sent:
+        return {"jobId": task["id"], "sent": sent, "received": 0, "avgRttMs": None,
+                "status": "TIMEOUT", "error": "No TCP connection succeeded"}
+    return _failure(task["id"], "Measurement deadline exceeded")
+
+
+def execute_measurement(task, allow_loopback=False, resolver=pin_target, ping=execute_ping, tcp=execute_tcp):
+    task = validate_task(task, allow_loopback)
+    deadline = time.monotonic() + task["timeoutSeconds"]
+    try:
+        address = resolver(task["target"], allow_loopback=allow_loopback, deadline=deadline)
+    except AgentError:
+        return _failure(task["id"], "DNS or public IP validation failed")
+    if task["protocol"] == "ICMP":
+        return ping(dict(task, target=str(address)), allow_loopback=allow_loopback, deadline=deadline)
+    return tcp(task, address, deadline)
+
+
+def heartbeat_tasks(response, role, host_id=None, allow_loopback=False):
     if (not isinstance(response, dict) or response.get("role") != role
             or type(response.get("heartbeatSeconds")) is not int or response["heartbeatSeconds"] != HEARTBEAT_SECONDS):
         raise AgentError("Invalid heartbeat response")
     tasks = response.get("tasks")
-    if not isinstance(tasks, list) or len(tasks) > MAX_TASKS or (role == "vps" and tasks):
+    if not isinstance(tasks, list) or len(tasks) > MAX_TASKS or (role != "vps" and tasks):
         raise AgentError("Invalid heartbeat task list")
     seen = set()
     for task in tasks:
         if not isinstance(task, dict):
             raise AgentError("Invalid probe task")
-        job_id = _identifier(task.get("id"))
+        validate_task(task, allow_loopback, expected_host=host_id)
+        job_id = task["id"]
         if job_id in seen:
             raise AgentError("Duplicate probe job identifier")
         seen.add(job_id)
@@ -295,10 +427,10 @@ def heartbeat_tasks(response, role):
 
 
 class Agent:
-    def __init__(self, config, client=None, ping=execute_ping):
+    def __init__(self, config, client=None, measure=None):
         self.config = validate_config(config)
         self.client = client or Client(self.config["server"], self.config["credential"], self.config["development"])
-        self.ping = ping
+        self.measure = measure or (lambda task: execute_measurement(task, allow_loopback=self.config["development"]))
         self.results, self.pending = OrderedDict(), OrderedDict()
 
     def _submit(self, result):
@@ -311,13 +443,15 @@ class Agent:
             return error.status in (400, 404, 409, 410)
 
     def step(self):
-        tasks = heartbeat_tasks(self.client.post("/api/agent/heartbeat", {}), self.config["role"])
+        tasks = heartbeat_tasks(self.client.post("/api/agent/heartbeat", {"agentVersion": AGENT_VERSION}),
+                                self.config["role"], self.config["id"], self.config["development"])
         new = [task for task in tasks if task["id"] not in self.results]
         if new:
-            # Ten bounded subprocesses run concurrently, so a full batch takes
-            # at most each ping's 8-second deadline plus 2-second kill margin.
+            # At most ten bounded measurements run concurrently. DNS and
+            # sockets share each task's deadline; ping has a one-second reap
+            # margin. API retries retain the measured payload by job ID.
             with ThreadPoolExecutor(max_workers=MAX_TASKS) as pool:
-                measured = list(pool.map(self.ping, new, timeout=12))
+                measured = list(pool.map(self.measure, new, timeout=12))
             for result in measured:
                 self.results[result["jobId"]] = result
         for task in tasks:
@@ -352,14 +486,29 @@ class Agent:
 
 
 def main(arguments=None):
+    arguments = sys.argv[1:] if arguments is None else arguments
+    if len(arguments) == 2 and arguments[0] == "--resolve-target":
+        try:
+            print(json.dumps(_resolve_worker(arguments[1]), allow_nan=False))
+            return 0
+        except (AgentError, OSError):
+            return 1
     parser = argparse.ArgumentParser(description="xiaowork Watch outbound Linux agent")
     parser.add_argument("--config", required=True)
     parser.add_argument("--enroll", action="store_true")
+    parser.add_argument("--check-upgrade", action="store_true")
     parser.add_argument("--server")
     parser.add_argument("--token")
     parser.add_argument("--development", action="store_true")
     options = parser.parse_args(arguments)
     try:
+        if options.check_upgrade:
+            if options.enroll or options.token is not None:
+                raise AgentError("Upgrade must preserve the existing credential")
+            config = read_config(options.config)
+            if config["role"] != "vps" or config["server"] != server_url(options.server, options.development):
+                raise AgentError("Upgrade requires an existing VPS configuration for this server")
+            return 0
         if options.enroll:
             enroll(options.server, options.token, options.config, options.development)
             print("Agent enrollment completed.")

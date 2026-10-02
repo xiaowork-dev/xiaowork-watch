@@ -21,9 +21,10 @@ agent = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(agent)
 TOKEN = "enrollment_token_fixture_123456789"
 CREDENTIAL = "credential_fixture_123456789012345"
-TASK = {"id": "job_1", "hostId": 1, "target": "8.8.8.8", "sent": 5, "timeoutSeconds": 8}
+TASK = {"id": "a" * 32, "hostId": 1, "nodeId": 1, "target": "8.8.8.8", "protocol": "ICMP", "port": None,
+        "sent": 5, "timeoutSeconds": 8, "taskVersion": 2}
 CONFIG = {"schema": 1, "server": "https://watch.example.com", "credential": CREDENTIAL,
-          "id": 1, "role": "probe", "heartbeatSeconds": 30, "development": False}
+          "id": 1, "role": "vps", "heartbeatSeconds": 30, "development": False}
 PING_OK = """PING 8.8.8.8 (8.8.8.8) 56(84) bytes of data.
 
 --- 8.8.8.8 ping statistics ---
@@ -106,7 +107,7 @@ class PingTests(unittest.TestCase):
             self.assertEqual(arguments, ["/usr/bin/ping", family, "-n", "-q", "-c", "5", "-i", "1", "-W", "2", "-w", "8", "--", target])
             self.assertNotIn("shell", run.call_args.kwargs)
             self.assertEqual(run.call_args.kwargs["env"]["LC_ALL"], "C")
-            self.assertEqual(run.call_args.kwargs["timeout"], 10)
+            self.assertEqual(run.call_args.kwargs["timeout"], 9)
         for failure in (OSError("missing ping"), subprocess.TimeoutExpired("ping", 10)):
             run = Mock(side_effect=failure)
             self.assertEqual(agent.execute_ping(TASK, runner=run)["status"], "ERROR")
@@ -148,9 +149,10 @@ class ProtocolTests(unittest.TestCase):
         def response(path, body):
             if path.endswith("enroll"):
                 self.assertEqual(body, {"token": TOKEN})
-                return success({"credential": CREDENTIAL, "role": "probe", "id": 1, "heartbeatSeconds": 30})
+                return success({"credential": CREDENTIAL, "role": "vps", "id": 1, "heartbeatSeconds": 30})
             if path.endswith("heartbeat"):
-                return success({"role": "probe", "heartbeatSeconds": 30, "tasks": [TASK]})
+                self.assertEqual(body, {"agentVersion": 2})
+                return success({"role": "vps", "heartbeatSeconds": 30, "tasks": [TASK]})
             return success({"accepted": True})
         with tempfile.TemporaryDirectory() as temporary, http_fixture(response) as (server, calls):
             path = Path(temporary) / "config.json"
@@ -158,7 +160,7 @@ class ProtocolTests(unittest.TestCase):
             self.assertNotIn(TOKEN, path.read_text())
             if os.name == "posix":
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-            runtime = agent.Agent(config, ping=lambda task: agent.parse_ping(task["id"], PING_OK, 0))
+            runtime = agent.Agent(config, measure=lambda task: agent.parse_ping(task["id"], PING_OK, 0))
             self.assertEqual(runtime.step(), 1)
             self.assertEqual(calls[0][0], "/api/agent/enroll")
             self.assertNotIn("Authorization", calls[0][1])
@@ -193,7 +195,8 @@ class ProtocolTests(unittest.TestCase):
         attempts = [agent.ApiError(), agent.ApiError(status=409)]
         def post(path, body):
             if path.endswith("heartbeat"):
-                return {"role": "probe", "heartbeatSeconds": 30, "tasks": [TASK]}
+                self.assertEqual(body, {"agentVersion": 2})
+                return {"role": "vps", "heartbeatSeconds": 30, "tasks": [TASK]}
             results.append(dict(body))
             failure = attempts.pop(0) if attempts else None
             if failure:
@@ -201,7 +204,7 @@ class ProtocolTests(unittest.TestCase):
             return {}
         client.post.side_effect = post
         ping = Mock(return_value=agent.parse_ping(TASK["id"], PING_PARTIAL, 1))
-        runtime = agent.Agent(CONFIG, client=client, ping=ping)
+        runtime = agent.Agent(CONFIG, client=client, measure=ping)
         runtime.step()
         self.assertIn(TASK["id"], runtime.pending)
         runtime.step()
@@ -209,16 +212,16 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(results[0], results[1])
         ping.assert_called_once_with(TASK)
 
-    def test_vps_never_pings_and_task_limit_or_wrong_role_rejected(self):
+    def test_empty_vps_and_legacy_probe_task_limit_or_wrong_role_rejected(self):
         ping = Mock()
         client = Mock()
         client.post.return_value = {"role": "vps", "heartbeatSeconds": 30, "tasks": []}
-        runtime = agent.Agent(dict(CONFIG, role="vps"), client=client, ping=ping)
+        runtime = agent.Agent(CONFIG, client=client, measure=ping)
         self.assertEqual(runtime.step(), 0)
         ping.assert_not_called()
-        for payload in ({"role": "probe", "heartbeatSeconds": 30, "tasks": [TASK] * 11},
-                        {"role": "probe", "heartbeatSeconds": 30, "tasks": [TASK, TASK]},
-                        {"role": "vps", "heartbeatSeconds": 30, "tasks": [TASK]},
+        for payload in ({"role": "vps", "heartbeatSeconds": 30, "tasks": [TASK] * 11},
+                        {"role": "vps", "heartbeatSeconds": 30, "tasks": [TASK, TASK]},
+                        {"role": "probe", "heartbeatSeconds": 30, "tasks": [TASK]},
                         {"role": "probe", "heartbeatSeconds": 0, "tasks": []}):
             with self.subTest(payload=payload), self.assertRaises(agent.AgentError):
                 agent.heartbeat_tasks(payload, payload["role"])
