@@ -1,6 +1,6 @@
 <script setup>
 import { onBeforeUnmount, ref } from 'vue'
-import { ChevronDown } from 'lucide-vue-next'
+import { ChevronDown, Monitor, Sun, Moon } from 'lucide-vue-next'
 import { getThemeController } from '../theme.js'
 
 const emit = defineEmits(['change'])
@@ -24,6 +24,9 @@ function select(value) {
 
 <template>
   <div class="theme-switch">
+    <Sun v-if="preference === 'light'" class="theme-icon" :size="17" aria-hidden="true" />
+    <Moon v-else-if="preference === 'dark'" class="theme-icon" :size="17" aria-hidden="true" />
+    <Monitor v-else class="theme-icon" :size="17" aria-hidden="true" />
     <select
       class="theme-select"
       aria-label="显示主题"

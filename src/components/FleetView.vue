@@ -1,8 +1,8 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
-import { Server, Network, Plus, RefreshCw, LoaderCircle, AlertCircle, ChevronLeft, ChevronRight, Pencil, Pause, Play, Trash2, Terminal, CircleHelp, Check, X } from 'lucide-vue-next'
+import { Server, Network, Plus, RefreshCw, LoaderCircle, AlertCircle, ChevronLeft, ChevronRight, Pencil, Pause, Play, Trash2, SquareTerminal as Terminal, CircleHelp, Check, X, Search } from 'lucide-vue-next'
 import { fleetApi as api } from '../api/fleet.js'
-import { agentState, resultIsStale } from '../api/time.js'
+import { agentState, resultIsStale, relativeTime } from '../api/time.js'
 import { targetConfigured, canMeasureHost, formatEndpoint, latestMeasurement, failureRate as loss, measurementRtt as rawRtt, measurementLabel, failureLabel, directionLabel, measurementProtocol } from '../api/measurements.js'
 import FleetForm from './FleetForm.vue'
 import InstallDialog from './InstallDialog.vue'
@@ -12,7 +12,10 @@ const fleet = ref({ hosts: [], nodes: [], results: [] }), loading = ref(true), e
 const history = ref({ records: [], total: 0, page: 1, size: 8 }), historyLoading = ref(false), historyError = ref(''), clock = ref(Date.now())
 let toastTimer, pollTimer, pendingInstall, alive = true, request = 0, historyRequest = 0
 const title = computed(() => props.kind === 'vps' ? 'VPS 监控' : '测速目标')
+const search = ref('')
+const searchTerm = computed(() => search.value.trim().toLowerCase())
 const list = computed(() => props.kind === 'vps' ? fleet.value.hosts : fleet.value.nodes)
+const filteredList = computed(() => !searchTerm.value ? list.value : list.value.filter(item => [item.name, item.address, item.region, props.kind === 'nodes' ? formatEndpoint(item.address, item.protocol, item.port) : ''].some(value => String(value ?? '').toLowerCase().includes(searchTerm.value))))
 const current = computed(() => props.kind === 'vps' ? fleet.value.hosts.find(h => h.id === props.selectedId) : null)
 const state = item => agentState(item, clock.value)
 const summary = computed(() => props.kind === 'vps' ? { total: list.value.length, online: list.value.filter(x => state(x) === 'ONLINE').length, offline: list.value.filter(x => state(x) === 'OFFLINE').length, pending: list.value.filter(x => state(x) === 'PENDING').length } : { total: list.value.length, online: list.value.filter(x => x.enabled && targetConfigured(x)).length, offline: list.value.filter(x => !x.enabled && targetConfigured(x)).length, pending: list.value.filter(x => !targetConfigured(x)).length })
@@ -68,7 +71,8 @@ async function remove() {
  catch (e) { deleteError.value = e.message } finally { busy.value = false }
 }
 const affected = computed(() => deleting.value ? fleet.value.hosts.filter(h => h.nodeIds.includes(deleting.value.id)).length : 0)
-watch(() => props.selectedId, value => { ++historyRequest; historyLoading.value = false; history.value = { records: [], total: 0, page: 1, size: 8 }; if (value) loadHistory(); nextTick(() => document.getElementById(value ? 'fleet-detail-title' : 'fleet-list-title')?.focus()) }, { immediate: true })
+watch(() => props.selectedId, value => { ++historyRequest; historyLoading.value = false; history.value = { records: [], total: 0, page: 1, size: 8 }; if (value) loadHistory(); if (value) nextTick(() => document.getElementById('fleet-detail-title')?.focus()) }, { immediate: true })
+watch(() => props.kind, () => { search.value = '' })
 watch(() => props.editable, value => { if (!value) { formState.value = null; installing.value = null; deleting.value = null; pendingInstall = null } })
 onMounted(() => { load(); pollTimer = setInterval(() => { clock.value = Date.now(); load(); if (props.selectedId) loadHistory(history.value.page, true) }, 15000) })
 onUnmounted(() => { alive = false; clearTimeout(toastTimer); clearInterval(pollTimer); ++request; ++historyRequest; pendingInstall = null })
@@ -77,29 +81,31 @@ onUnmounted(() => { alive = false; clearTimeout(toastTimer); clearInterval(pollT
  <div class="fleet-view">
   <div v-if="selectedId && !current" class="empty-state"><AlertCircle :size="30" /><h3>{{loading ? '正在加载 VPS…' : '无法读取这台 VPS'}}</h3><p v-if="error" role="alert">{{error}}</p><button class="button" @click="back">返回 VPS 监控</button></div>
   <template v-else-if="!current">
-   <div class="page-heading list-heading"><div><h2 id="fleet-list-title" tabindex="-1">{{title}}<span>{{list.length}}</span></h2><p>{{kind === 'vps' ? '每台 VPS 向外部测速目标测量出站延迟。' : '外部 DNS 主机名或 IP；选择 ICMP Ping 或 TCP 连接。'}}</p></div><button v-if="editable" class="button primary" :disabled="loading || busy" @click="openForm()"><Plus :size="18" />{{kind === 'vps' ? '添加 VPS' : '添加目标'}}</button></div>
-   <section class="status-summary" :aria-label="title + '状态汇总'">
-    <span class="summary-item"><strong>{{summary.total}}</strong><span class="summary-label">{{kind === 'vps' ? '台 VPS' : '个目标'}}</span></span>
-    <span class="summary-item"><i class="status-dot up"></i><strong>{{summary.online}}</strong><span class="summary-label">{{kind === 'vps' ? '探针在线' : '已启用'}}</span></span>
-    <span class="summary-item"><i class="status-dot down"></i><strong>{{summary.offline}}</strong><span class="summary-label">{{kind === 'vps' ? '探针离线' : '已停用'}}</span></span>
-    <span class="summary-item"><i class="status-dot unknown"></i><strong>{{summary.pending}}</strong><span class="summary-label">{{kind === 'vps' ? '待安装' : '待补地址'}}</span></span>
-   </section>
-   <section class="monitor-panel" :aria-busy="loading"><div class="panel-toolbar"><h2>{{kind === 'vps' ? '所有 VPS' : '所有测速目标'}}<span>{{kind === 'vps' ? 'Linux VPS 探针' : '无需安装探针'}}</span></h2><button class="button subtle" :disabled="loading || busy" @click="load"><RefreshCw :size="15" :class="{spin:loading}" />刷新列表</button></div>
+   <section class="monitor-panel directory-panel" :aria-busy="loading" aria-labelledby="fleet-list-title">
+    <div class="panel-toolbar directory-toolbar">
+     <div class="directory-title"><h2 id="fleet-list-title">{{kind === 'vps' ? 'VPS 列表' : '测速目标'}}</h2><span class="directory-count">{{searchTerm ? filteredList.length + ' / ' + list.length : list.length}} {{kind === 'vps' ? '台' : '个'}}</span></div>
+     <div class="directory-controls">
+      <div class="directory-search"><Search :size="17" aria-hidden="true" /><input v-model="search" type="search" :aria-label="kind === 'vps' ? '搜索 VPS' : '搜索测速目标'" placeholder="搜索名称、地址或地区" /><button v-if="search" type="button" class="search-clear" aria-label="清除搜索" title="清除搜索" @click="search = ''"><X :size="15" aria-hidden="true" /></button></div>
+      <button class="icon-button toolbar-refresh" :disabled="loading || busy" title="刷新列表" aria-label="刷新列表" @click="load"><RefreshCw :size="18" :class="{spin:loading}" /></button>
+      <button v-if="editable" class="button primary" :disabled="loading || busy" @click="openForm()"><Plus :size="18" />{{kind === 'vps' ? '添加 VPS' : '添加目标'}}</button>
+     </div>
+    </div>
     <div v-if="error" class="empty-state"><AlertCircle :size="30" /><h3>列表加载失败</h3><p role="alert">{{error}}</p><button class="button" @click="load">重试</button></div>
     <div v-else-if="loading && !list.length" class="empty-state"><LoaderCircle :size="28" class="spin" /><p>正在加载…</p></div>
     <div v-else-if="!list.length" class="empty-state"><Server v-if="kind === 'vps'" :size="34" /><Network v-else :size="34" /><h3>{{kind === 'vps' ? '暂无 VPS' : '暂无测速目标'}}</h3><p>{{kind === 'vps' ? '管理员添加 VPS 并安装探针后，真实心跳会显示在这里。' : '管理员配置外部地址并关联 VPS 后，可查看出站测量。'}}</p><button v-if="editable" class="button primary" @click="openForm()"><Plus :size="16" />{{kind === 'vps' ? '添加 VPS' : '添加目标'}}</button></div>
-    <div v-else class="table-scroll"><table class="monitor-table fleet-table responsive-table"><thead><tr><th>{{kind === 'vps' ? 'VPS 名称 / 地址' : '目标名称 / 地址'}}</th><th>{{kind === 'vps' ? '探针心跳' : '协议'}}</th><th>{{kind === 'vps' ? '测速目标' : '关联 VPS'}}</th><th>{{kind === 'vps' ? '最近心跳' : '配置状态'}}</th><th class="align-right">操作</th></tr></thead><tbody>
-     <tr v-for="item in list" :key="item.id" :class="{'disabled-row':!item.enabled}">
-      <td :data-label="kind === 'vps' ? 'VPS 名称 / 地址' : '目标名称 / 地址'"><div class="monitor-identity"><span class="service-icon"><Server v-if="kind === 'vps'" :size="20" /><Network v-else :size="20" /></span><div><button v-if="kind === 'vps'" class="monitor-name" @click="detail(item)">{{item.name}}<ChevronRight :size="14" /></button><b v-else class="fleet-node-name">{{item.name}}</b><span class="monitor-url">{{kind === 'vps' ? item.address : targetConfigured(item) ? formatEndpoint(item.address,item.protocol,item.port) : '请补齐目标地址'}}</span><small v-if="item.region" class="paused-label">{{item.region}}</small></div></div></td>
-      <td :data-label="kind === 'vps' ? '探针心跳' : '协议'"><template v-if="kind === 'vps'"><span :class="['status-badge',stateClass(item)]"><i class="status-dot"></i>{{stateLabel(item)}}</span><small v-if="item.agentUpdateRequired" class="field-error paused-label">探针需升级</small><small v-if="!item.enabled" class="paused-label">已停用测量</small></template><span v-else class="status-badge unknown">{{item.protocol || '待配置'}}</span></td>
+    <div v-else-if="!filteredList.length" class="empty-state search-empty"><Search :size="30" /><h3>{{kind === 'vps' ? '没有匹配的 VPS' : '没有匹配的测速目标'}}</h3><p>试试其他名称、地址或地区。</p><button class="button" @click="search = ''">清除搜索</button></div>
+    <div v-else class="table-scroll"><table class="monitor-table directory-table fleet-directory-table responsive-table"><thead><tr><th>{{kind === 'vps' ? 'VPS' : '测速目标'}}</th><th>{{kind === 'vps' ? '探针状态' : '协议'}}</th><th>{{kind === 'vps' ? '测速目标' : '关联 VPS'}}</th><th>{{kind === 'vps' ? '最近心跳' : '配置状态'}}</th><th class="align-right">操作</th></tr></thead><tbody>
+     <tr v-for="item in filteredList" :key="item.id" :class="{'disabled-row':!item.enabled}">
+      <td :data-label="kind === 'vps' ? 'VPS' : '测速目标'"><div class="directory-identity"><div class="identity-line"><button v-if="kind === 'vps'" class="monitor-name" @click="detail(item)">{{item.name}}</button><b v-else class="fleet-node-name">{{item.name}}</b><span v-if="item.region" class="region-label">{{item.region}}</span></div><span class="monitor-url">{{kind === 'vps' ? item.address : targetConfigured(item) ? formatEndpoint(item.address,item.protocol,item.port) : '请补齐目标地址'}}</span></div></td>
+      <td :data-label="kind === 'vps' ? '探针状态' : '协议'"><template v-if="kind === 'vps'"><span :class="['status-badge','agent-status',stateClass(item),{'agent-online':state(item) === 'ONLINE'}]"><i v-if="state(item) !== 'ONLINE'" class="status-dot"></i>{{stateLabel(item)}}</span><small v-if="item.agentUpdateRequired" class="field-error paused-label">探针需升级</small><small v-if="!item.enabled" class="paused-label">已停用测量</small></template><span v-else class="status-badge unknown">{{item.protocol || '待配置'}}</span></td>
       <td :data-label="kind === 'vps' ? '测速目标' : '关联 VPS'">{{kind === 'vps' ? item.nodeIds.length : fleet.hosts.filter(h => h.nodeIds.includes(item.id)).length}} {{kind === 'vps' ? '个' : '台'}}</td>
-      <td data-label="最近心跳" v-if="kind === 'vps'" class="muted mono">{{at(item.lastSeenAt)}}</td><td data-label="配置状态" v-else><span :class="['status-badge',!targetConfigured(item) ? 'unknown' : item.enabled ? 'up' : 'paused']">{{!targetConfigured(item) ? '待补地址 · 已停用' : item.enabled ? '已启用' : '已停用'}}</span><small v-if="!targetConfigured(item)" class="paused-label">旧版目标保留，需管理员配置地址</small></td>
-      <td data-label="操作"><div v-if="editable" class="row-actions"><button v-if="kind === 'vps'" class="button subtle" :disabled="busy" @click="install(item,item.agentUpdateRequired ? 'upgrade' : 'fresh')"><Terminal :size="15" />{{item.agentUpdateRequired ? '升级探针' : '安装 / 升级'}}</button><button class="icon-button" :aria-label="'编辑 ' + item.name" title="编辑" :disabled="busy" @click="openForm(item)"><Pencil :size="16" /></button><button class="icon-button" :aria-label="(item.enabled ? '停用 ' : '启用 ') + item.name" :title="item.enabled ? '停用测量' : '启用测量'" :disabled="busy || (kind !== 'vps' && !targetConfigured(item) && !item.enabled)" @click="mutate(() => api.toggle(kind,item.id,!item.enabled),item.enabled ? '已停用，历史结果保留' : '已启用')"><Pause v-if="item.enabled" :size="16" /><Play v-else :size="16" /></button><button class="icon-button danger-text" :aria-label="'删除 ' + item.name" title="删除" :disabled="busy" @click="askDelete(item)"><Trash2 :size="16" /></button></div><button v-else-if="kind === 'vps'" class="button subtle" @click="detail(item)">查看详情</button><span v-else class="muted">只读</span></td>
+      <td data-label="最近心跳" v-if="kind === 'vps'" class="muted" :title="at(item.lastSeenAt)">{{relativeTime(item.lastSeenAt,clock)}}</td><td data-label="配置状态" v-else><span :class="['status-badge',!targetConfigured(item) ? 'unknown' : item.enabled ? 'up' : 'paused']">{{!targetConfigured(item) ? '待补地址 · 已停用' : item.enabled ? '已启用' : '已停用'}}</span><small v-if="!targetConfigured(item)" class="paused-label">旧版目标保留，需管理员配置地址</small></td>
+      <td data-label="操作"><div v-if="editable" class="row-actions"><button v-if="kind === 'vps'" class="icon-button" :disabled="busy" :aria-label="(item.agentUpdateRequired ? '升级探针 ' : '安装或升级探针 ') + item.name" :title="item.agentUpdateRequired ? '升级探针' : '安装 / 升级探针'" @click="install(item,item.agentUpdateRequired ? 'upgrade' : 'fresh')"><Terminal :size="17" /></button><button class="icon-button" :aria-label="'编辑 ' + item.name" title="编辑" :disabled="busy" @click="openForm(item)"><Pencil :size="17" /></button><button class="icon-button" :aria-label="(item.enabled ? '停用 ' : '启用 ') + item.name" :title="item.enabled ? '停用测量' : '启用测量'" :disabled="busy || (kind !== 'vps' && !targetConfigured(item) && !item.enabled)" @click="mutate(() => api.toggle(kind,item.id,!item.enabled),item.enabled ? '已停用，历史结果保留' : '已启用')"><Pause v-if="item.enabled" :size="17" /><Play v-else :size="17" /></button><button class="icon-button danger-text" :aria-label="'删除 ' + item.name" title="删除" :disabled="busy" @click="askDelete(item)"><Trash2 :size="17" /></button></div><button v-else-if="kind === 'vps'" class="button subtle" @click="detail(item)">查看详情<ChevronRight :size="16" /></button><span v-else class="muted">只读</span></td>
      </tr>
     </tbody></table></div>
-    <div v-if="list.length && !error" class="table-footer"><span>共 {{list.length}} {{kind === 'vps' ? '台 VPS' : '个测速目标'}}</span><span>{{kind === 'vps' ? '心跳状态与测量结果分别记录' : '配置不代表可达；实际可达性由 VPS 测量'}}</span></div>
+    <div v-if="list.length && !error" class="table-footer directory-footer"><span class="summary-text">{{summary.online}} {{kind === 'vps' ? '在线' : '启用'}}<span aria-hidden="true"> · </span>{{summary.offline}} {{kind === 'vps' ? '离线' : '停用'}}<span aria-hidden="true"> · </span>{{summary.pending}} {{kind === 'vps' ? '待安装' : '待补地址'}}</span><span class="refresh-note">自动刷新 · 15 秒</span></div>
    </section>
-   <p class="fleet-context"><CircleHelp :size="16" />{{kind === 'vps' ? '点击 VPS 名称查看出站延迟。VPS 心跳超过 90 秒显示离线。' : '测速目标无需安装或心跳。公网地址由 VPS 端解析并测量，不会自动将旧目标名称当作地址。'}}</p>
+   <p class="fleet-context"><CircleHelp :size="16" />{{kind === 'vps' ? '点击 VPS 名称查看出站延迟。VPS 心跳超过 90 秒显示离线。' : '测速目标无需安装探针。实际可达性由各台 VPS 测量，ICMP 与 TCP 分别记录。'}}</p>
   </template>
   <template v-else>
    <button class="back-button" @click="back"><ChevronLeft :size="16" />返回 VPS 监控</button>

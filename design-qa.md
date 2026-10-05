@@ -1,47 +1,60 @@
-# v0.6.0 设计验收
-
 final result: passed
 
-2026-10-05 采用用户当次选择的第 2 套 Compact infrastructure desk，改造已有真实监控系统。最终同一输入对比和交互检查未发现未解决的 P0/P1/P2。
+# v0.6.1 Compact service directory — design QA
 
-## 视觉依据与证据
+Date: 2026-10-05. Scope: the selected second design applied to the existing monitoring frontend, including public and administrator views, website/VPS/latency-target lists, existing details and forms, and light/dark/system themes.
 
-- 源图：`docs/design/v0.6.0/selected-reference.png`，1672×941 像素；原始生成结果 `exec-ca85b782-fc04-4627-ae48-29fba22fd9fc.png`。按目标 CSS 画布1280×720等比近似归一，横向密度1.30625、纵向1.30694，比例误差小于1像素；未将整张图作为网页背景。
-- 实现：`http://127.0.0.1:5173/`，实际Vue前端、原API客户端及Python主控。视觉验证使用Ops中的独立SQLite数据库，关闭调度器，两条记录与源图内容一致；该数据库、密码和验收脚本不进入仓库或部署包。正式安装依旧空数据，生产继续真实检测。
-- 最终桌面CSS视口1280×720，devicePixelRatio=1，原生浏览器截图1280×720，`day-final.jpg`。初次默认浏览器DPR=2，但原生截图仍输出1280×720 CSS尺寸；最终用明确视口/DPR1复查。未混用双倍密度像素进行排版判断。
-- 状态：匿名、网站列表、个人博客选中、1正常/1异常、系统主题且当前系统为浅色。更新时间取实际读取时间，相对检测时间为“刚刚”；不固定生产时间戳。
-- 全视图同一输入：`day-final-comparison.png`，左源图/右浏览器；聚焦同一输入：`day-final-toolbar.png`与`day-final-list-inspector.png`，上下源图/浏览器。初次比较证据为`day-before-comparison.png`、`day-before-list-inspector.png`。以上文件均位于`docs/design/v0.6.0/`。
-- 扩展状态：`night-final.jpg`、`history-night.jpg`、`mobile-day.jpg`、`small-night.jpg`、`tablet-final.jpg`、`login-mobile-night.jpg`、`edit-mobile-night.jpg`、`target-form-mobile-night.jpg`。夜间和手机未另有源图，按同一布局、语义与阅读体验适配，不宣称夜间像素复刻。
-- 手机验证390×844、320×844 CSS；平板800×844 CSS。原生可见截取会因滚动条/面板可见高度缩小，390/320时可见内容宽375/305。响应式结论同时以DOM实际视口和scrollWidth核实，不拉伸手机截图。
+## Source and comparison
 
-## 比较过程与修复
+- Authoritative source: `docs/design/v0.6.1/selected-reference.png`, the second displayed ideation result (Compact service directory). The supplied VPS screenshot grounded the exploration; it was not substituted for the user's selected option.
+- Source native size: 1724 × 912. Uniformly normalized to 1440 × 762 for a same-viewport desktop comparison; the browser capture is 1440 × 762 at one screenshot pixel per CSS pixel.
+- Source and implementation were opened together in `day-final-comparison.png`. The toolbar and row details were separately inspected in `day-final-toolbar.png` and `day-final-rows.png`.
+- The final main table at this viewport is x=248, y=92, width=1164, height=508. The implementation preserves the 64px full-width header, 220px sidebar, 28px main gutter, internal toolbar, thin table border, alternating rows, and restrained monochrome actions.
+- No photographic or illustrative assets are present in the selected UI. The editable text wordmark and existing library icons remain native frontend elements. The terminal action uses the closest boxed terminal icon.
 
-1. **P2，已修复：详情指标向右约9px、检测记录入口低约13px。** 初次全视图和聚焦比较显示标签/数值对齐及纵向节奏偏离源图。标题行高改1.3、标题区底内边距18px，指标行间距14px，列宽116px/minmax(0,1fr)。最终聚焦对比中值列及历史入口恢复对齐。
-2. **P2，已修复：日间辅助文字、未知状态与placeholder对比不足。** 初版#7a8490/#75808d在白与侧栏背景仅约3.41–4.02:1。统一提高为#626d7a：白底5.27:1、侧栏#f1f3f5底4.73:1。重新捕获最终日间画面后再次合成比较，保持原灰白视觉。
-3. **P3，已顺手修复：网站行实际82px，比源图79px稍松。** 减少上下内边距至12.5px，浏览器DOM实测行高79px；最终第二行底边贴近源图。
-4. 最终全视图、工具栏、密集列表和详情区域在同一输入内复查；无新增需要修复的P0/P1/P2。程序化标题焦点无黑框，按钮/输入键盘焦点仍清晰。
+## Findings resolved
 
-## 五项视觉核对
+| Priority | Finding | Correction | Evidence |
+| --- | --- | --- | --- |
+| P2 | Desktop names, addresses, and metadata were too small relative to the selected reference. | Increased name/address/region/header/footer typography and adjusted row text hierarchy. | `day-final-comparison.png`, `day-final-rows.png` |
+| P2 | The operation heading did not align with the start of the action controls. | Aligned the last fleet heading and row actions to the left. | `day-final-toolbar.png`, `day-final-rows.png` |
+| P2 | Adjacent target/heartbeat headings were cramped at tablet widths. | Adjusted column proportions, tablet header size, and configuration wrapping for 761–1100px. | `tablet-public-night-final.jpg` |
+| P2 | Target search omitted the port from a displayed TCP endpoint. | Added the existing formatted endpoint to searchable fields, including bracketed IPv6 with a port. | Full TCP endpoint and `formatEndpoint` verification |
 
-- **字体与排版**：Segoe UI/Microsoft YaHei/PingFang SC系统无衬线，26px栏目标题、20px网站名称、27px详情标题，14–15px状态和指标。数字等宽、网址次要；生成图未提供确定字体文件，跨系统字形和抗锯齿差异属于P3。长网址桌面截断并提供title，手机允许换行；数字与ms保持同行。
-- **间距与布局**：187px侧栏、89px顶栏、330px详情栏，列表左右17px，表头49px、记录79px。细分隔线、异常细色线和柔和选中底色，主页面无装饰性统计卡片、渐变或阴影。窄屏详情在列表后排列，保留返回入口；800px布局无字段互相遮挡、无整页横向滚动。
-- **色彩与token**：日间白色#ffffff/灰侧栏#f1f3f5，正文#121a23、正常#00786d、异常#bd2033；夜间#15191d/#1a1f24、正文#e8edf2。状态同时有文字，未知与停用保持明确语义。小字对比修正后达标，原生选择框、弹窗、表单、代码和提示覆盖两套主题；首屏背景与CSS一致。
-- **图像与资产**：源图无照片、插画或独立图形资产；品牌是可编辑文字，导航、登录、详情/历史采用既有Lucide标准图标，并核对其官方FileText样式。未新增仿画Logo、占位图片或把源图栅格化成网页。原生JPEG与生成PNG的压缩差异不误判为CSS模糊。
-- **文案与内容**：源图名称/地址、正常/失败、HTTP、响应时间、最近检测和记录入口全部实现。更新时间、结果、未知/停用计数仍取API；没有虚构可用率或曲线。版本号放侧栏供升级识别，后台补充实际管理按钮，这是产品所需差异。
+No unresolved P0, P1, or P2 findings remain. Minor native font rendering differences and a few pixels of vertical geometry are P3 follow-up polish only.
 
-## 浏览器行为与必要检查
+## Browser verification
 
-- 点击导航站即时切换概览，不改变列表URL；刷新后仍保留导航站。纯逻辑检查覆盖异常置顶、不修改API数组、刷新保留选择、删除回退、空列表和仅停用记录。
-- 查看检测记录打开原公开详情深链接，真实API返回4条本地验证历史；返回列表正常。后台记录链接使用原/admin路径，权限规则未改。
-- 手机选择后详情标题获得焦点；返回列表恢复到`monitor-2`。320px与390px无横向溢出，800px详情堆叠、字段仍分离可读。
-- 浅色/深色/系统主题切换、深色刷新后保留，主题下拉框可用。系统变化、跨标签同步、禁用存储、旧matchMedia API等由既有主题测试验证；未更改用户操作系统主题。
-- 匿名VPS与测速目标页面无需登录、保持空列表，只读UI无编辑/检测/安装操作。独立本地管理员登录、更多菜单、预填编辑表单、取消、TCP配置项显示与退出正常；弹窗在390px视口内，长表单可在自己的区域滚动。
-- Vue后台登录标题层级统一，样式与交互不变；服务器/探针/部署代码未修改。
-- 浏览器最终warn/error日志为空。
-- 本地Node20：既有25项前端检查、15项主题测试、7项选择行为检查全部通过；最终生产构建通过，git diff --check通过。提交后的Linux完整CI另作发布验证，不用本地构建代替CI。
+All browser checks used the existing local app through the Codex in-app browser. The app was connected to an isolated backend and disposable SQLite test database; illustrative addresses and measurement fixtures exist only in local QA. They are not production defaults or release contents.
 
-## 可接受差异与后续
+- Desktop administrator VPS list at 1440 × 762: online, offline, and pending installation rows; status summary; search; refresh; actions; and source comparison passed.
+- Search accepts case differences and surrounding whitespace, matches VPS region and website address, preserves filtering after refresh, and offers a working clear action when no results match. Summary counts continue to describe the complete list.
+- Administrator login, VPS edit/save, enable/disable, and installation guide passed against the existing API. A new disposable VPS was saved and automatically opened its installation guide, then removed from the disposable database. Delete confirmation was opened and cancelled.
+- VPS name opens the existing route and actual detail response. TCP connection results, ICMP packet loss, failed measurements, and historical records remain distinct.
+- Website names open the existing detection history directly. Public and administrator detail views retain a working refresh action; administrator manual checks and editing remain available.
+- Latency-target search and the TCP/ICMP add form passed. Switching protocol reveals or hides the TCP port appropriately.
+- Public website, VPS, and latency-target routes are accessible without login. Administrator mutation controls are hidden; public navigation and details remain usable. The backend authorization boundary is unchanged.
+- Empty website, VPS, and latency-target lists display the appropriate empty state with zero counts. Installation defaults remain empty.
+- Dark mode, light mode, and system selection render correctly. Theme preference survives a reload. Existing automated theme tests cover system changes, cross-tab updates, and inaccessible storage.
+- Responsive checks passed at 320 × 800, 390 × 844, and 800 × 900, with no document-level horizontal overflow. Mobile forms, installation instructions, details, login, navigation, and confirmation dialogs remain usable.
+- Responsive sizes above are the requested viewport overrides. Native in-app screenshot dimensions reflect available content and scrollbars: small view 305 × 756; phone lists 375 × 763; phone dialogs 390 × 793; tablet views 800 × 793. Desktop comparison captures are exactly 1440 × 762.
+- Final browser warning/error logs: none.
 
-P3：生成参考未指定字体，文字笔画和细节字重随系统字体略有差异；侧栏增加小版本号，实时更新时间随运行变化。长表单和手机详情为源图未描绘的必要适配。没有未解决的P0/P1/P2。
+## Evidence
 
-预览在本机保留运行；GitHub提交、完整CI与版本安装包确认属于随后发布交付步骤。
+- `docs/design/v0.6.1/day-final.jpg`: source-equivalent desktop administrator view.
+- `docs/design/v0.6.1/day-final-comparison.png`, `day-final-toolbar.png`, `day-final-rows.png`: full and focused reference comparisons.
+- `docs/design/v0.6.1/night-final.jpg`: desktop administrator dark theme.
+- `docs/design/v0.6.1/mobile-night.jpg`, `edit-mobile-night.jpg`, `target-form-mobile-night.jpg`, `login-mobile-night.jpg`: mobile dark list, edit, TCP form, and empty-credential login.
+- `docs/design/v0.6.1/mobile-public-day.jpg`, `small-public-night.jpg`, `tablet-public-night-final.jpg`: public phone, small-screen, and tablet views.
+- `docs/design/v0.6.1/empty-public-day.jpg`: empty installation state.
+- `docs/design/v0.6.1/public-web-day.jpg`, `public-vps-day.jpg`: desktop public views.
+- `docs/design/v0.6.1/target-endpoint-search.jpg`: case-insensitive full TCP endpoint search.
+
+## Code and release scope
+
+The existing 25 frontend, 15 theme, and 7 selection checks passed (47 total). Vue single-file component compilation and CSS parsing passed. The production build and Git whitespace check passed. Release delivery also runs the existing Linux backend, agent, updater, installer, and Node 22 build checks.
+
+This version changes the frontend and its documentation only. The production backend, agents, installation/update system, API authorization, and data schema (2) are unchanged. The source design shows three row actions; the implementation retains the existing fourth enable/disable action. A concise explanatory line preserves the heartbeat/offline and VPS-to-target measurement semantics.
+
+QA screenshots contain local illustrative records. Database files, probe tokens, credentials, and test fixture scripts are excluded from the repository and installation package.
