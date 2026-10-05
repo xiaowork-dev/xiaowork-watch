@@ -17,7 +17,7 @@ async function submit() {
 </script>
 <template>
  <section class="login-panel" aria-labelledby="login-title">
-  <div class="dialog-icon"><LockKeyhole :size="23" /></div><h1 id="login-title">管理员登录</h1><p class="dialog-description">登录后可管理监控、探针和测量任务。</p>
+  <div class="dialog-icon"><LockKeyhole :size="23" /></div><h2 id="login-title">管理员登录</h2><p class="dialog-description">登录后可管理监控、探针和测量任务。</p>
   <form @submit.prevent="submit">
    <div class="form-fields">
     <div class="field"><label for="admin-username">用户名</label><input id="admin-username" v-model="username" autocomplete="username" maxlength="100" required :disabled="submitting" /></div>

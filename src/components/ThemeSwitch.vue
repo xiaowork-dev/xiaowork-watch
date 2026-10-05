@@ -1,14 +1,14 @@
 <script setup>
-import { onBeforeUnmount, ref, useId } from 'vue'
+import { onBeforeUnmount, ref } from 'vue'
+import { ChevronDown } from 'lucide-vue-next'
 import { getThemeController } from '../theme.js'
 
 const emit = defineEmits(['change'])
 const controller = getThemeController()
 const preference = ref(controller.getSnapshot().preference)
-const name = `theme-${useId()}`
 const options = [
-  { value: 'light', label: '日间' },
-  { value: 'dark', label: '夜间' },
+  { value: 'light', label: '浅色' },
+  { value: 'dark', label: '深色' },
   { value: 'system', label: '跟随系统' },
 ]
 const unsubscribe = controller.subscribe((snapshot) => {
@@ -23,23 +23,17 @@ function select(value) {
 </script>
 
 <template>
-  <fieldset class="theme-switch" aria-label="显示主题">
-    <legend class="sr-only">显示主题</legend>
-    <label
-      v-for="option in options"
-      :key="option.value"
-      class="theme-choice"
-      :class="{ 'is-active': preference === option.value }"
+  <div class="theme-switch">
+    <select
+      class="theme-select"
+      aria-label="显示主题"
+      :value="preference"
+      @change="select($event.target.value)"
     >
-      <input
-        class="theme-radio"
-        type="radio"
-        :name="name"
-        :value="option.value"
-        :checked="preference === option.value"
-        @change="select(option.value)"
-      />
-      <span>{{ option.label }}</span>
-    </label>
-  </fieldset>
+      <option v-for="option in options" :key="option.value" :value="option.value">
+        {{ option.label }}
+      </option>
+    </select>
+    <ChevronDown class="theme-chevron" :size="14" aria-hidden="true" focusable="false" />
+  </div>
 </template>

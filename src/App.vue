@@ -1,10 +1,11 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
-import { Activity, Radio, Plus, ChevronRight, RefreshCw, Ellipsis, CircleHelp, Play, Pause, Pencil, Trash2, X, ChevronLeft, LoaderCircle, Check, AlertCircle, Globe2, Clock3, ShieldCheck, FileClock, Server, Network, LogIn, LogOut, Circle } from 'lucide-vue-next'
+import { Activity, Radio, Plus, ChevronRight, RefreshCw, Ellipsis, CircleHelp, Play, Pause, Pencil, Trash2, X, ChevronLeft, LoaderCircle, Check, AlertCircle, Globe2, Clock3, ShieldCheck, FileClock, Server, Network, LogIn, LogOut, Info, FileText } from 'lucide-vue-next'
 import { monitorsApi as api } from './api/monitors.js'
 import { authApi, getSession, subscribeSession } from './api/client.js'
 import { parseRoute, routePath } from './api/routes.js'
 import { relativeTime } from './api/time.js'
+import { sortMonitors, resolveInspectionId } from './api/selection.js'
 import MonitorForm from './components/MonitorForm.vue'
 import FleetView from './components/FleetView.vue'
 import StatusBadge from './components/StatusBadge.vue'
@@ -15,12 +16,14 @@ const section = computed(() => route.value.section), selected = computed(() => s
 const canManage = computed(() => route.value.admin && !session.value.loading && session.value.authenticated)
 const loginRequired = computed(() => route.value.admin && !session.value.authenticated)
 const sectionTitle = computed(() => section.value === 'web' ? '网站监控' : section.value === 'vps' ? 'VPS 监控' : '测速目标')
+const inspectionId = ref(null)
 const monitors = ref([]), loading = ref(true), pageError = ref(''), menuId = ref(null), formState = ref(null)
 const history = ref({ records: [], total: 0, page: 1, size: 8 }), historyLoading = ref(false), historyError = ref(''), checking = ref([]), busyIds = ref([])
 const toast = ref(null), deleteTarget = ref(null), deleting = ref(false), deleteError = ref(''), confirmDialog = ref(null), refreshTime = ref(null)
 let toastTimer, pollTimer, unsubscribe, historyRequest = 0, listRequest = 0, alive = true
 const summary = computed(() => ({ total: monitors.value.length, up: monitors.value.filter(m => m.enabled && m.lastStatus === 'UP').length, down: monitors.value.filter(m => m.enabled && m.lastStatus === 'DOWN').length, unknown: monitors.value.filter(m => m.enabled && (!m.lastStatus || m.lastStatus === 'UNKNOWN')).length, paused: monitors.value.filter(m => !m.enabled).length }))
-const visibleMonitors = computed(() => [...monitors.value].sort((a, b) => Number(b.enabled && b.lastStatus === 'DOWN') - Number(a.enabled && a.lastStatus === 'DOWN')))
+const visibleMonitors = computed(() => sortMonitors(monitors.value))
+const inspectedMonitor = computed(() => monitors.value.find(m => m.id === inspectionId.value) || null)
 const currentMonitor = computed(() => monitors.value.find(m => m.id === selected.value) || null)
 const checkLabel = '立即检测'
 const historyPages = computed(() => Math.max(1, Math.ceil(history.value.total / history.value.size)))
@@ -49,7 +52,7 @@ async function logout() {
 async function loadList() {
  if (loading.value && listRequest > 0) return
  const request = ++listRequest; loading.value = true; pageError.value = ''
- try { const value = await api.list(); if (alive && request === listRequest) { monitors.value = value; refreshTime.value = new Date() } }
+ try { const value = await api.list(); if (alive && request === listRequest) { monitors.value = value; inspectionId.value = resolveInspectionId(visibleMonitors.value, inspectionId.value); refreshTime.value = new Date() } }
  catch (error) { if (alive && request === listRequest) pageError.value = error.message }
  finally { if (alive && request === listRequest) loading.value = false }
 }
@@ -62,6 +65,15 @@ async function loadHistory(page = 1, background = false) {
  catch (error) { if (alive && request === historyRequest) historyError.value = error.message }
  finally { if (alive && request === historyRequest) historyLoading.value = false }
 }
+function scrollToInspection(element) {
+ element?.focus({ preventScroll: true })
+ element?.scrollIntoView({ block: 'center', behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth' })
+}
+function inspectMonitor(id) {
+ inspectionId.value = id; menuId.value = null
+ if (window.matchMedia('(max-width: 760px)').matches) nextTick(() => scrollToInspection(document.getElementById('inspector-title')))
+}
+function returnToInspectionList() { scrollToInspection(document.getElementById('monitor-' + inspectionId.value)) }
 function openDetail(id) { setRoute({ section: 'web', id, admin: route.value.admin }) }
 function goBack() { navigate('web'); nextTick(() => document.getElementById('list-title')?.focus()) }
 function fleetDetail(id) { setRoute({ section: 'vps', id, admin: route.value.admin }) }
@@ -110,41 +122,71 @@ onUnmounted(() => { alive = false; ++listRequest; ++historyRequest; unsubscribe?
 </script>
 <template>
  <div class="app-shell">
-  <header class="site-header">
-   <div class="header-inner">
-    <a class="brand" :href="link('web')" @click.prevent="navigate('web')"><span>xiaowork</span><span class="brand-light">Watch</span></a>
-    <nav class="primary-nav" aria-label="主要导航">
-     <a :class="['nav-item',{active:section === 'web'}]" :href="link('web')" :aria-current="section === 'web' ? 'page' : undefined" @click.prevent="navigate('web')">网站监控</a>
-     <a :class="['nav-item',{active:section === 'vps'}]" :href="link('vps')" :aria-current="section === 'vps' ? 'page' : undefined" @click.prevent="navigate('vps')">VPS 监控</a>
-     <a :class="['nav-item',{active:section === 'nodes'}]" :href="link('nodes')" :aria-current="section === 'nodes' ? 'page' : undefined" @click.prevent="navigate('nodes')">测速目标</a>
-    </nav>
-    <div class="header-tools">
-     <ThemeSwitch />
-     <div class="session-actions"><span v-if="canManage" class="access-badge">管理员</span><template v-if="canManage"><button class="button subtle" @click="publicPage">公开页</button><button class="button subtle" :disabled="logoutBusy" @click="logout"><LogOut :size="15" />退出登录</button></template><button v-else-if="!route.admin" class="button subtle" @click="enterAdmin"><LogIn :size="15" />进入后台</button><button v-else class="button subtle" @click="publicPage">返回公开页</button></div>
-    </div>
-   </div>
-  </header>
+  <aside class="site-rail">
+   <a class="brand-link" :href="link('web')" @click.prevent="navigate('web')"><span class="brand-wordmark">xiaowork</span><span class="brand-product">Watch</span></a>
+   <nav class="primary-nav" aria-label="主要导航">
+    <a :class="['nav-link',{'nav-active':section === 'web'}]" :href="link('web')" :aria-current="section === 'web' ? 'page' : undefined" @click.prevent="navigate('web')">网站监控</a>
+    <a :class="['nav-link',{'nav-active':section === 'vps'}]" :href="link('vps')" :aria-current="section === 'vps' ? 'page' : undefined" @click.prevent="navigate('vps')">VPS 监控</a>
+    <a :class="['nav-link',{'nav-active':section === 'nodes'}]" :href="link('nodes')" :aria-current="section === 'nodes' ? 'page' : undefined" @click.prevent="navigate('nodes')">测速目标</a>
+   </nav>
+   <div class="rail-footer"><span><ShieldCheck v-if="canManage" :size="16" /><Info v-else :size="16" />{{canManage ? '管理员后台' : '公开只读'}}</span><small>v0.6.0</small></div>
+  </aside>
   <div class="main-shell">
-   <main>
+   <header class="workspace-header">
+    <div class="header-heading">
+     <h1 :id="section === 'web' && !selected ? 'list-title' : 'section-title'" tabindex="-1">{{sectionTitle}}</h1>
+     <div v-if="section === 'web' && !selected && !loginRequired && !pageError && monitors.length" class="header-summary" aria-label="监控状态汇总"><span class="count-up">{{summary.up}} 正常</span><span aria-hidden="true">·</span><span class="count-down">{{summary.down}} 异常</span><span v-if="summary.unknown" class="count-unknown">· {{summary.unknown}} 未检测</span><span v-if="summary.paused" class="count-unknown">· {{summary.paused}} 停用</span></div>
+     <time v-if="section === 'web' && !loginRequired && refreshTime" class="header-updated" :datetime="refreshTime.toISOString()" :title="'每 15 秒读取检测结果；刷新不会发起检测'">更新于 {{refreshTime.toLocaleString('zh-CN', {year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false})}}</time>
+    </div>
+    <div class="header-actions">
+     <ThemeSwitch />
+     <button v-if="section === 'web' && !loginRequired" class="button subtle" :disabled="loading" @click="refresh"><RefreshCw :size="16" :class="{spin:loading}" />{{loading ? '加载中' : '刷新'}}</button>
+     <div class="session-actions"><template v-if="canManage"><button class="button subtle" @click="publicPage">公开页</button><button class="button subtle" :disabled="logoutBusy" @click="logout"><LogOut :size="16" />退出登录</button></template><button v-else-if="!route.admin" class="button subtle" @click="enterAdmin"><LogIn :size="16" />进入后台</button><button v-else class="button subtle" @click="publicPage">返回公开页</button></div>
+    </div>
+   </header>
+   <main :class="['main-content', {'website-list-page':section === 'web' && !selected && !loginRequired}]">
     <div v-if="route.admin && session.loading" class="empty-state"><LoaderCircle :size="28" class="spin" /><p>正在检查管理员会话…</p></div>
     <AdminLogin v-else-if="loginRequired" :session-error="session.error" @success="refresh" />
     <FleetView v-else-if="section !== 'web'" :key="section" :kind="section === 'vps' ? 'vps' : 'nodes'" :editable="canManage" :selected-id="route.id" @detail="fleetDetail" @back="navigate('vps')" />
     <template v-else>
     <div v-if="selected && !currentMonitor" class="empty-state"><AlertCircle :size="30" /><h3>{{loading ? '正在加载监控…' : '无法读取这个监控'}}</h3><p v-if="pageError" role="alert">{{pageError}}</p><button class="button" @click="goBack">返回列表</button></div>
     <template v-else-if="!currentMonitor">
-     <div class="page-heading"><div><h1 id="list-title" tabindex="-1">网站监控</h1></div><button v-if="canManage" class="button primary" @click="openForm()"><Plus :size="18" />新增监控</button></div>
-     <section class="status-summary" aria-label="监控状态汇总"><div class="summary-up"><strong>{{summary.up}}</strong><span class="summary-label">正常</span></div><div class="summary-down"><strong>{{summary.down}}</strong><span class="summary-label">异常</span></div><div v-if="summary.unknown" class="summary-unknown"><strong>{{summary.unknown}}</strong><span class="summary-label">未检测</span></div><div class="summary-unknown"><strong>{{summary.paused}}</strong><span class="summary-label">停用</span></div></section>
-     <section class="monitor-panel" :aria-busy="loading"><div class="panel-toolbar"><h2><span>共 {{monitors.length}} 个监控对象 · HTTP / HTTPS</span></h2><button class="button subtle" :disabled="loading" @click="refresh"><RefreshCw :size="15" :class="{spin:loading}" />{{loading ? '加载中…' : '刷新状态'}}</button></div>
-      <div v-if="pageError" class="empty-state"><AlertCircle :size="32" /><h3>列表加载失败</h3><p role="alert">{{pageError}}</p><button class="button" @click="loadList">重试</button></div>
-      <div v-else-if="loading && !monitors.length" class="empty-state"><LoaderCircle :size="28" class="spin" /><p>正在加载监控…</p></div>
-      <div v-else-if="!monitors.length" class="empty-state"><Radio :size="36" /><h3>暂无网站监控</h3><p>管理员添加监控后，真实检测结果会显示在这里。</p><button v-if="canManage" class="button primary" @click="openForm()"><Plus :size="16" />新增监控</button></div>
-      <div v-else class="table-scroll"><table class="monitor-table responsive-table website-table"><thead><tr><th>监控对象</th><th>状态</th><th>HTTP</th><th>响应时间</th><th>最近检测</th><th class="align-right">操作</th></tr></thead><tbody><tr v-for="m in visibleMonitors" :key="m.id" :class="{ 'disabled-row': !m.enabled, 'failed-row': m.enabled && m.lastStatus === 'DOWN' }"><td data-label="监控对象"><div class="monitor-identity"><span :class="['monitor-marker', !m.enabled ? 'paused' : m.lastStatus === 'UP' ? 'up' : m.lastStatus === 'DOWN' ? 'down' : 'unknown']" aria-hidden="true"><AlertCircle v-if="m.enabled && m.lastStatus === 'DOWN'" :size="19" /><Circle v-else :size="14" fill="currentColor" :stroke-width="0" /></span><div><button class="monitor-name" @click="openDetail(m.id)">{{m.name}}<ChevronRight :size="14" /></button><span class="monitor-url" :title="m.url">{{m.url}}</span></div></div></td><td data-label="状态"><StatusBadge :status="m.lastStatus" :enabled="m.enabled" /></td><td class="mono" data-label="HTTP">{{m.lastHttpCode ?? '—'}}</td><td data-label="响应时间"><span class="response-value mono">{{m.lastResponseTimeMs ?? '—'}}<span v-if="m.lastResponseTimeMs != null" class="muted"> ms</span></span></td><td class="muted" data-label="最近检测" :title="at(m.lastCheckedAt)">{{since(m.lastCheckedAt)}}</td><td class="align-right" data-label="操作"><div v-if="canManage" class="row-actions"><button class="icon-button" :aria-label="m.name + '：' + checkLabel" :title="checkLabel" :disabled="!m.enabled || checking.includes(m.id) || busyIds.includes(m.id)" @click="check(m)"><LoaderCircle v-if="checking.includes(m.id)" :size="17" class="spin" /><Play v-else :size="16" /></button><div class="action-menu-container"><button class="icon-button" :aria-label="m.name + '：更多操作'" aria-haspopup="menu" :aria-expanded="menuId === m.id" :disabled="checking.includes(m.id) || busyIds.includes(m.id)" @click.stop="menuId = menuId === m.id ? null : m.id"><Ellipsis :size="20" /></button><div v-if="menuId === m.id" class="action-menu" role="menu"><button role="menuitem" @click="openDetail(m.id)"><FileClock :size="15" />查看详情</button><button role="menuitem" @click="openForm(m)"><Pencil :size="15" />编辑监控</button><button role="menuitem" @click="toggle(m)"><Pause v-if="m.enabled" :size="15" /><Play v-else :size="15" />{{m.enabled ? '停用监控' : '启用监控'}}</button><button role="menuitem" class="danger-text" @click="askDelete(m)"><Trash2 :size="15" />删除监控</button></div></div></div><button v-else class="button subtle" @click="openDetail(m.id)">查看详情</button></td></tr></tbody></table></div>
-      <div v-if="monitors.length && !pageError" class="table-footer"><span>共 {{monitors.length}} 个监控目标</span><span>列表更新时间 {{refreshTime?.toLocaleTimeString('zh-CN', {hour12: false}) || '—'}}</span></div>
-     </section>
+
+     <div :class="['website-workspace',{'has-inspector':inspectedMonitor && !pageError}]">
+      <section class="website-list" aria-labelledby="list-title">
+       <div v-if="canManage" class="list-actions"><span>{{monitors.length}} 个监控对象</span><button class="button primary" @click="openForm()"><Plus :size="16" />新增监控</button></div>
+       <section class="monitor-panel" :aria-busy="loading">
+        <div v-if="pageError" class="empty-state"><AlertCircle :size="32" /><h2>列表加载失败</h2><p role="alert">{{pageError}}</p><button class="button" @click="loadList">重试</button></div>
+        <div v-else-if="loading && !monitors.length" class="empty-state"><LoaderCircle :size="28" class="spin" /><p>正在加载监控…</p></div>
+        <div v-else-if="!monitors.length" class="empty-state"><Radio :size="32" /><h2>暂无网站监控</h2><p>管理员添加监控后，真实检测结果会显示在这里。</p><button v-if="canManage" class="button primary" @click="openForm()"><Plus :size="16" />新增监控</button></div>
+        <div v-else class="table-scroll"><table :class="['monitor-table','responsive-table','website-table',{'editable-table':canManage}]"><thead><tr><th>监控对象</th><th>状态</th><th>HTTP</th><th>响应时间</th><th>最近检测</th><th><span class="sr-only">{{canManage ? '管理操作' : '查看概览'}}</span></th></tr></thead><tbody>
+         <tr v-for="m in visibleMonitors" :key="m.id" :class="{'disabled-row':!m.enabled,'failed-row':m.enabled && m.lastStatus === 'DOWN','monitor-row-selected':inspectionId === m.id}">
+          <td data-label="监控对象"><div class="monitor-identity"><div><button :id="'monitor-' + m.id" class="monitor-name" :aria-pressed="inspectionId === m.id" aria-controls="website-inspector" @click="inspectMonitor(m.id)">{{m.name}}</button><span class="monitor-url" :title="m.url">{{m.url}}</span></div></div></td>
+          <td data-label="状态"><StatusBadge :status="m.lastStatus" :enabled="m.enabled" /></td>
+          <td class="mono" data-label="HTTP">{{m.lastHttpCode ?? '—'}}</td>
+          <td data-label="响应时间"><span class="response-value mono">{{m.lastResponseTimeMs ?? '—'}}<span v-if="m.lastResponseTimeMs != null" class="muted"> ms</span></span></td>
+          <td class="muted" data-label="最近检测" :title="at(m.lastCheckedAt)">{{since(m.lastCheckedAt)}}</td>
+          <td class="align-right" data-label="操作"><div v-if="canManage" class="row-actions"><button class="icon-button" :aria-label="m.name + '：' + checkLabel" :title="checkLabel" :disabled="!m.enabled || checking.includes(m.id) || busyIds.includes(m.id)" @click="check(m)"><LoaderCircle v-if="checking.includes(m.id)" :size="17" class="spin" /><Play v-else :size="16" /></button><div class="action-menu-container"><button class="icon-button" :aria-label="m.name + '：更多操作'" aria-haspopup="menu" :aria-expanded="menuId === m.id" :disabled="checking.includes(m.id) || busyIds.includes(m.id)" @click.stop="menuId = menuId === m.id ? null : m.id"><Ellipsis :size="20" /></button><div v-if="menuId === m.id" class="action-menu" role="menu"><button role="menuitem" @click="openDetail(m.id)"><FileClock :size="15" />查看检测记录</button><button role="menuitem" @click="openForm(m)"><Pencil :size="15" />编辑监控</button><button role="menuitem" @click="toggle(m)"><Pause v-if="m.enabled" :size="15" /><Play v-else :size="15" />{{m.enabled ? '停用监控' : '启用监控'}}</button><button role="menuitem" class="danger-text" @click="askDelete(m)"><Trash2 :size="15" />删除监控</button></div></div></div><button v-else class="icon-button row-inspect-button" :aria-label="m.name + '：查看概览'" :aria-pressed="inspectionId === m.id" aria-controls="website-inspector" @click="inspectMonitor(m.id)"><ChevronRight :size="20" /></button></td>
+         </tr>
+        </tbody></table></div>
+       </section>
+      </section>
+      <aside v-if="inspectedMonitor && !pageError" id="website-inspector" class="website-inspector" aria-labelledby="inspector-title">
+       <button class="back-button inspector-back" @click="returnToInspectionList"><ChevronLeft :size="16" />返回列表</button>
+       <div class="inspector-heading"><h2 id="inspector-title" tabindex="-1" aria-live="polite">{{inspectedMonitor.name}}</h2><p :title="inspectedMonitor.url">{{inspectedMonitor.url}}</p></div>
+       <dl class="inspector-metrics">
+        <div><dt>状态</dt><dd><StatusBadge :status="inspectedMonitor.lastStatus" :enabled="inspectedMonitor.enabled" /></dd></div>
+        <div><dt>最近响应时间</dt><dd :class="['mono',{'danger-text':inspectedMonitor.enabled && inspectedMonitor.lastStatus === 'DOWN'}]">{{inspectedMonitor.lastResponseTimeMs ?? '—'}}<span v-if="inspectedMonitor.lastResponseTimeMs != null"> ms</span></dd></div>
+        <div><dt>HTTP 状态</dt><dd class="mono">{{inspectedMonitor.lastHttpCode ?? '—'}}</dd></div>
+        <div><dt>最近检测</dt><dd :title="at(inspectedMonitor.lastCheckedAt)">{{since(inspectedMonitor.lastCheckedAt)}}</dd></div>
+       </dl>
+       <a class="inspector-history-link" :href="link('web',inspectedMonitor.id)" @click.prevent="openDetail(inspectedMonitor.id)"><FileText :size="19" /><span>查看检测记录</span><ChevronRight :size="19" /></a>
+      </aside>
+     </div>
     </template>
     <template v-else>
      <button class="back-button" @click="goBack"><ChevronLeft :size="16" />返回监控列表</button>
-     <div class="page-heading detail-heading"><div class="detail-identity"><span :class="['service-icon large', currentMonitor.color || 'purple']">{{currentMonitor.initial || currentMonitor.name[0]}}</span><div><h1 id="detail-title" tabindex="-1">{{currentMonitor.name}}</h1><div class="detail-url">{{currentMonitor.url}}</div></div></div><div v-if="canManage" class="detail-actions"><button class="button" :disabled="checking.includes(currentMonitor.id)" @click="openForm(currentMonitor)"><Pencil :size="16" />编辑</button><button class="button primary" :disabled="!currentMonitor.enabled || checking.includes(currentMonitor.id)" @click="check(currentMonitor)"><LoaderCircle v-if="checking.includes(currentMonitor.id)" :size="16" class="spin" /><Play v-else :size="16" />{{checking.includes(currentMonitor.id) ? '检测中…' : checkLabel}}</button></div></div>
+     <div class="page-heading detail-heading"><div class="detail-identity"><span :class="['service-icon large', currentMonitor.color || 'purple']">{{currentMonitor.initial || currentMonitor.name[0]}}</span><div><h2 id="detail-title" tabindex="-1">{{currentMonitor.name}}</h2><div class="detail-url">{{currentMonitor.url}}</div></div></div><div v-if="canManage" class="detail-actions"><button class="button" :disabled="checking.includes(currentMonitor.id)" @click="openForm(currentMonitor)"><Pencil :size="16" />编辑</button><button class="button primary" :disabled="!currentMonitor.enabled || checking.includes(currentMonitor.id)" @click="check(currentMonitor)"><LoaderCircle v-if="checking.includes(currentMonitor.id)" :size="16" class="spin" /><Play v-else :size="16" />{{checking.includes(currentMonitor.id) ? '检测中…' : checkLabel}}</button></div></div>
      <p v-if="pageError" class="inline-error" role="alert">{{pageError}}；下方保留最后一次读取的数据。</p><section class="detail-overview"><div><span class="summary-label">当前状态</span><StatusBadge :status="currentMonitor.lastStatus" :enabled="currentMonitor.enabled" show-code /><small v-if="!currentMonitor.enabled">最近结果：{{currentMonitor.lastStatus || 'UNKNOWN'}}</small></div><div><span class="summary-label">HTTP 状态码</span><strong class="mono">{{currentMonitor.lastHttpCode ?? '—'}}</strong></div><div><span class="summary-label">最近响应时间</span><strong class="mono">{{currentMonitor.lastResponseTimeMs ?? '—'}}<small v-if="currentMonitor.lastResponseTimeMs != null"> ms</small></strong></div><div><span class="summary-label">最近检测</span><b class="detail-time">{{at(currentMonitor.lastCheckedAt)}}</b></div></section>
      <section class="config-strip" aria-label="监控配置"><span><Globe2 :size="16" />请求方法<b>{{currentMonitor.method}}</b></span><span><Clock3 :size="16" />检测间隔<b>{{currentMonitor.intervalSeconds}} 秒</b></span><span><ShieldCheck :size="16" />超时<b>{{currentMonitor.timeoutMs}} 毫秒</b></span><button v-if="canManage" :disabled="checking.includes(currentMonitor.id) || busyIds.includes(currentMonitor.id)" @click="toggle(currentMonitor)"><Pause v-if="currentMonitor.enabled" :size="14" /><Play v-else :size="14" />{{currentMonitor.enabled ? '停用监控' : '启用监控'}}</button></section>
      <section class="monitor-panel history-panel" :aria-busy="historyLoading"><div class="panel-toolbar"><h2>检测历史<span>最新记录优先</span></h2><button class="button subtle" :disabled="historyLoading" @click="loadHistory(history.page)"><RefreshCw :size="15" :class="{spin:historyLoading}" />刷新记录</button></div>
@@ -156,9 +198,7 @@ onUnmounted(() => { alive = false; ++listRequest; ++historyRequest; unsubscribe?
      </section>
     </template>
     </template>
-    <p v-if="!loginRequired" class="fleet-context">{{canManage ? '管理员后台' : '公开只读 · 管理员登录后可修改'}} · 每 15 秒刷新数据</p>
    </main>
-   <footer class="app-footer"><span>xiaowork Watch</span><span>网站 · VPS · 测速目标 · v0.5.0</span></footer>
   </div>
   <MonitorForm v-if="canManage && formState" :monitor="formState.monitor" :on-save="saveMonitor" @close="formState = null" />
   <dialog v-if="canManage && deleteTarget" ref="confirmDialog" class="confirm-dialog" aria-labelledby="delete-title" @cancel.prevent="closeDelete"><div class="delete-icon"><Trash2 :size="24" /></div><h2 id="delete-title">删除这个监控？</h2><p>将删除「{{deleteTarget.name}}」及其检测历史，此操作无法撤销。</p><p v-if="deleteError" class="inline-error" role="alert">{{deleteError}}</p><div class="dialog-footer"><button class="button" :disabled="deleting" autofocus @click="closeDelete">取消</button><button class="button danger" :disabled="deleting" @click="removeMonitor"><LoaderCircle v-if="deleting" :size="16" class="spin" />{{deleting ? '删除中…' : '确认删除'}}</button></div></dialog>

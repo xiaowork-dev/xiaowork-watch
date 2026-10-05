@@ -64,6 +64,7 @@ jobs:
         run: |
           node tests/test_frontend.mjs
           npm run test:theme
+          npm run test:selection
           npm run build
       - name: Package verified build
         env:
